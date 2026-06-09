@@ -1,0 +1,26 @@
+# Environment
+.env
+
+# Dependencies
+.venv/
+
+# Cache & output
+cache/
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

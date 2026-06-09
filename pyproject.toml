@@ -1,0 +1,16 @@
+[project]
+name = "world-cup-analyzer"
+version = "0.1.0"
+description = "World Cup 2026 match analyzer powered by AI"
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]>=0.9.0",
+    "rich>=13.7.0",
+    "httpx>=0.27.0",
+    "openai>=1.30.0",
+    "python-dotenv>=1.0.0",
+    "markdown>=3.6",
+]
+
+[project.scripts]
+wca = "main:app"
