@@ -483,7 +483,7 @@ class FootballAPI:
         return players
 
     def get_odds(self, fixture_id: int) -> list[BookmakerOdds]:
-        results = self._get("/odds", {"fixture": fixture_id, "bet": 1}, "odds")
+        results = self._get("/odds", {"fixture": fixture_id}, "odds")
         bookmakers = []
         for r in results:
             for bm in r.get("bookmakers", []):
@@ -497,6 +497,25 @@ class FootballAPI:
                             away=vals.get("Away", "?"),
                         ))
         return bookmakers[:5]
+
+    def get_odds_markets(self, fixture_id: int) -> dict[str, dict[str, float]]:
+        """Best available odd per market and outcome across all bookmakers,
+        e.g. {"Goals Over/Under": {"Under 2.5": 1.85, ...}, ...}."""
+        results = self._get("/odds", {"fixture": fixture_id}, "odds")
+        markets: dict[str, dict[str, float]] = {}
+        for r in results:
+            for bm in r.get("bookmakers", []):
+                for bet in bm.get("bets", []):
+                    vals = markets.setdefault(bet.get("name", ""), {})
+                    for v in bet.get("values", []):
+                        try:
+                            odd = float(v["odd"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        label = str(v.get("value", ""))
+                        if odd > vals.get(label, 0.0):
+                            vals[label] = odd
+        return markets
 
     def get_topassists(self, limit: int = 10) -> list[PlayerStat]:
         results = self._get(

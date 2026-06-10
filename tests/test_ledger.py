@@ -2,7 +2,43 @@ import pytest
 
 import ledger
 from api.models import Team, WCFixture
-from ledger import extract_best_bet, grade_bet, load_predictions, record_prediction
+from ledger import extract_best_bet, grade_bet, load_predictions, price_bet, record_prediction
+
+MARKETS = {
+    "Match Winner": {"Home": 1.65, "Draw": 3.80, "Away": 5.50},
+    "Goals Over/Under": {"Over 2.5": 2.10, "Under 2.5": 1.78},
+    "Both Teams Score": {"Yes": 1.95, "No": 1.85},
+    "Asian Handicap": {"Home -1": 2.45, "Away +1": 1.55},
+    "Double Chance": {"Home/Draw": 1.22, "Draw/Away": 2.30},
+    "Draw No Bet": {"Home": 1.30, "Away": 3.40},
+}
+
+
+@pytest.mark.parametrize(
+    "bet,expected",
+    [
+        ("Under 2.5 goals", 1.78),
+        ("Over 2.5 goals", 2.10),
+        ("Both teams to score: No", 1.85),
+        ("BTTS yes", 1.95),
+        ("Mexico to win", 1.65),
+        ("South Africa moneyline", 5.50),
+        ("Mexico -1 Asian handicap", 2.45),
+        ("South Africa +1", 1.55),
+        ("Mexico or draw (double chance)", 1.22),
+        ("Mexico draw no bet", 1.30),
+        ("Draw", 3.80),
+        ("Over 3.5 goals", None),       # line not offered
+        ("First goalscorer: Jimenez", None),  # unrecognized market
+        (None, None),
+    ],
+)
+def test_price_bet(bet, expected):
+    assert price_bet(MARKETS, bet, "Mexico", "South Africa") == expected
+
+
+def test_price_bet_no_markets():
+    assert price_bet({}, "Under 2.5 goals", "Mexico", "South Africa") is None
 
 
 def test_extract_best_bet_with_confidence():
@@ -62,6 +98,7 @@ def test_record_and_load_roundtrip(tmp_path, monkeypatch):
     record_prediction(
         Team(id=16, name="Mexico"), Team(id=1531, name="South Africa"),
         fixture, analysis, "test-model", "results/report.html",
+        odds_markets=MARKETS,
     )
 
     preds = load_predictions()
@@ -71,6 +108,7 @@ def test_record_and_load_roundtrip(tmp_path, monkeypatch):
     assert entry["best_bet"] == "Mexico -1 Asian handicap"
     assert entry["confidence"] == "6"
     assert entry["home"] == "Mexico"
+    assert entry["odds"] == 2.45
 
 
 def test_load_predictions_empty(tmp_path, monkeypatch):

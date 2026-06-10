@@ -234,6 +234,7 @@ def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_c
                 fx_jobs["lineups"] = pool.submit(_safe, lambda: api.get_lineups(fid), [])
                 fx_jobs["api_prediction"] = pool.submit(_safe, lambda: api.get_predictions(fid), None)
                 fx_jobs["odds"] = pool.submit(_safe, lambda: api.get_odds(fid), [])
+                fx_jobs["odds_markets"] = pool.submit(_safe, lambda: api.get_odds_markets(fid), {})
                 fx_jobs["wc_events"] = pool.submit(_safe, lambda: api.get_fixture_events(fid), [])
                 fx_jobs["fixture_players"] = pool.submit(_safe, lambda: api.get_fixture_players(fid), [])
                 if fixture.status == "FT":
@@ -250,12 +251,13 @@ def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_c
     console.print(f"  [green]✓[/green] Form events: {event_count} events across {len(form_events)} matches")
 
     injuries, lineups, api_prediction = [], [], None
-    odds, wc_events, fixture_players, fixture_stats = [], [], [], []
+    odds, odds_markets, wc_events, fixture_players, fixture_stats = [], {}, [], [], []
     if fixture:
         injuries = fx["injuries"]
         lineups = fx["lineups"]
         api_prediction = fx["api_prediction"]
         odds = fx["odds"]
+        odds_markets = fx["odds_markets"]
         wc_events = fx["wc_events"]
         fixture_players = fx["fixture_players"]
         fixture_stats = fx.get("fixture_stats", [])
@@ -308,7 +310,7 @@ def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_c
     console.print(f"\n[green]✓[/green] Report saved: [bold]{report_path}[/bold]")
 
     from ledger import record_prediction
-    record_prediction(t1, t2, fixture, ai_analysis, model, report_path)
+    record_prediction(t1, t2, fixture, ai_analysis, model, report_path, odds_markets=odds_markets)
     console.print(f"[dim]Prediction recorded — run `record` to track results.[/dim]")
     return report_path
 
@@ -399,12 +401,17 @@ def record():
     table.add_column("Match")
     table.add_column("Best Bet")
     table.add_column("Conf", justify="center")
+    table.add_column("Odds", justify="right")
     table.add_column("Score", justify="center")
     table.add_column("Result", justify="center")
 
     wins = losses = 0
+    profit = 0.0
+    priced = 0
+    by_conf: dict[str, list[int]] = {}
     for p in preds:
         f = fixtures_by_id.get(p["fixture_id"])
+        odds = p.get("odds")
         if f and f.status in FINISHED_STATUSES and f.home_goals is not None:
             score = f"{f.home_goals}-{f.away_goals}"
             graded = grade_bet(p["best_bet"], p["home"], p["away"], f.home_goals, f.away_goals)
@@ -416,6 +423,12 @@ def record():
                 losses += 1
             else:
                 result = "[dim]ungraded[/dim]"
+            if graded is not None:
+                if odds:
+                    profit += (odds - 1) if graded else -1
+                    priced += 1
+                conf = p.get("confidence") or "?"
+                by_conf.setdefault(conf, [0, 0])[0 if graded else 1] += 1
         else:
             score, result = "—", "[dim]pending[/dim]"
         table.add_row(
@@ -423,6 +436,7 @@ def record():
             f"{p['home']} vs {p['away']}",
             p["best_bet"] or "—",
             f"{p['confidence']}/10" if p.get("confidence") else "—",
+            f"{odds:.2f}" if odds else "—",
             score,
             result,
         )
@@ -431,6 +445,18 @@ def record():
     graded_total = wins + losses
     if graded_total:
         console.print(f"Record: [bold]{wins}W-{losses}L[/bold] ({wins / graded_total:.0%}) over {graded_total} auto-graded bets")
+        if priced:
+            color = "green" if profit >= 0 else "red"
+            console.print(
+                f"Flat 1u stakes at best available odds: [{color}]{profit:+.2f}u[/{color}] "
+                f"over {priced} priced bets (ROI {profit / priced:+.1%})"
+            )
+        if len(by_conf) > 1:
+            parts = [
+                f"{conf}/10: {w}W-{l}L"
+                for conf, (w, l) in sorted(by_conf.items(), key=lambda kv: kv[0], reverse=True)
+            ]
+            console.print(f"By confidence: {'  |  '.join(parts)}")
 
 
 @app.command()

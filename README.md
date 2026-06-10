@@ -84,7 +84,7 @@ Each `analyze` run saves a self-contained HTML report to `results/`. Data is fet
 
 ## Prediction tracking
 
-Every analysis appends its **Best Bet** and confidence to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet), with a running win/loss record. Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
+Every analysis appends its **Best Bet**, confidence, and the best available bookmaker odds for that bet to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet), with a running win/loss record, profit/loss in units for flat 1-unit stakes with ROI, and a per-confidence breakdown — so you can see whether the high-conviction picks actually earn their rating. Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
 
 ---
 
