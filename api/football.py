@@ -7,13 +7,20 @@ import httpx
 
 from api.models import (
     ApiPrediction,
+    BookmakerOdds,
+    FixtureEvent,
+    FixturePlayerStat,
+    FixtureTeamStat,
     Injury,
+    Last5,
     LineupPlayer,
     MatchResult,
+    PlayerStat,
     StandingsEntry,
     Team,
     TeamLineup,
     TeamStats,
+    UnderOver,
     WCFixture,
 )
 
@@ -30,6 +37,14 @@ CACHE_TTL = {
     "stats": 1800,
     "standings": 1800,
     "predictions": 900,
+    "players": 1800,
+    "topscorers": 1800,
+    "fixture_stats": 900,
+    "fixture_events": 3600,
+    "fixture_players": 3600,
+    "odds": 3600,
+    "topassists": 1800,
+    "topyellowcards": 1800,
 }
 
 
@@ -280,6 +295,226 @@ class FootballAPI:
                     )
         return entries
 
+    def get_team_by_id(self, team_id: int) -> Optional[Team]:
+        results = self._get("/teams", {"id": team_id}, "teams")
+        if not results:
+            return None
+        r = results[0]
+        return Team(
+            id=r["team"]["id"],
+            name=r["team"]["name"],
+            code=r["team"].get("code"),
+            logo=r["team"].get("logo"),
+        )
+
+    def get_player_stats(self, team_id: int) -> list[PlayerStat]:
+        results = self._get(
+            "/players",
+            {"league": self.league_id, "season": self.season, "team": team_id},
+            "players",
+        )
+        players = []
+        for r in results:
+            p = r.get("player", {})
+            stats = (r.get("statistics") or [{}])[0]
+            games = stats.get("games", {})
+            goals = stats.get("goals", {})
+            shots = stats.get("shots", {})
+            passes = stats.get("passes", {})
+            cards = stats.get("cards", {})
+            players.append(PlayerStat(
+                player_id=p.get("id", 0),
+                name=p.get("name", ""),
+                appearances=games.get("appearences") or 0,
+                minutes=games.get("minutes") or 0,
+                goals=goals.get("total") or 0,
+                assists=goals.get("assists") or 0,
+                shots_on=shots.get("on") or 0,
+                key_passes=passes.get("key") or 0,
+                rating=games.get("rating"),
+                yellow_cards=cards.get("yellow") or 0,
+                red_cards=cards.get("red") or 0,
+            ))
+        return sorted(players, key=lambda p: (p.goals + p.assists, p.appearances), reverse=True)
+
+    def get_top_scorers(self, limit: int = 10) -> list[PlayerStat]:
+        results = self._get(
+            "/players/topscorers",
+            {"league": self.league_id, "season": self.season},
+            "topscorers",
+        )
+        players = []
+        for r in results[:limit]:
+            p = r.get("player", {})
+            stats = (r.get("statistics") or [{}])[0]
+            games = stats.get("games", {})
+            goals = stats.get("goals", {})
+            shots = stats.get("shots", {})
+            passes = stats.get("passes", {})
+            cards = stats.get("cards", {})
+            players.append(PlayerStat(
+                player_id=p.get("id", 0),
+                name=p.get("name", ""),
+                appearances=games.get("appearences") or 0,
+                minutes=games.get("minutes") or 0,
+                goals=goals.get("total") or 0,
+                assists=goals.get("assists") or 0,
+                shots_on=shots.get("on") or 0,
+                key_passes=passes.get("key") or 0,
+                rating=games.get("rating"),
+                yellow_cards=cards.get("yellow") or 0,
+                red_cards=cards.get("red") or 0,
+            ))
+        return players
+
+    def get_fixture_stats(self, fixture_id: int) -> list[FixtureTeamStat]:
+        results = self._get("/fixtures/statistics", {"fixture": fixture_id}, "fixture_stats")
+        team_stats = []
+        for r in results:
+            stats = {s["type"]: s["value"] for s in r.get("statistics", [])}
+            team_stats.append(FixtureTeamStat(
+                team=Team(id=r["team"]["id"], name=r["team"]["name"]),
+                possession=stats.get("Ball Possession"),
+                shots_total=stats.get("Total Shots"),
+                shots_on=stats.get("Shots on Goal"),
+                corners=stats.get("Corner Kicks"),
+                passes_total=stats.get("Total passes"),
+                pass_accuracy=stats.get("Passes %"),
+                fouls=stats.get("Fouls"),
+                offsides=stats.get("Offsides"),
+                saves=stats.get("Goalkeeper Saves"),
+            ))
+        return team_stats
+
+    def get_fixture_events(self, fixture_id: int) -> list[FixtureEvent]:
+        results = self._get("/fixtures/events", {"fixture": fixture_id}, "fixture_events")
+        events = []
+        for r in results:
+            t = r.get("time", {})
+            team = r.get("team", {})
+            player = r.get("player", {})
+            assist = r.get("assist", {}) or {}
+            events.append(FixtureEvent(
+                minute=t.get("elapsed") or 0,
+                extra_minute=t.get("extra"),
+                team=Team(id=team.get("id", 0), name=team.get("name", "")),
+                player=player.get("name") or "Unknown",
+                assist=assist.get("name") or None,
+                type=r.get("type") or "",
+                detail=r.get("detail") or "",
+                comments=r.get("comments"),
+            ))
+        return events
+
+    def get_fixture_players(self, fixture_id: int) -> list[FixturePlayerStat]:
+        results = self._get("/fixtures/players", {"fixture": fixture_id}, "fixture_players")
+        players = []
+        for team_block in results:
+            team_data = team_block.get("team", {})
+            t = Team(id=team_data.get("id", 0), name=team_data.get("name", ""))
+            for p_data in team_block.get("players", []):
+                p = p_data.get("player", {})
+                stats = (p_data.get("statistics") or [{}])[0]
+                games = stats.get("games", {})
+                goals_s = stats.get("goals", {})
+                shots_s = stats.get("shots", {})
+                passes_s = stats.get("passes", {})
+                tackles_s = stats.get("tackles", {})
+                cards_s = stats.get("cards", {})
+                gk = stats.get("goalkeeper", {})
+                players.append(FixturePlayerStat(
+                    player_id=p.get("id", 0),
+                    name=p.get("name", ""),
+                    team=t,
+                    minutes=games.get("minutes") or 0,
+                    rating=games.get("rating"),
+                    goals=goals_s.get("total") or 0,
+                    assists=goals_s.get("assists") or 0,
+                    shots_on=shots_s.get("on") or 0,
+                    key_passes=passes_s.get("key") or 0,
+                    tackles=tackles_s.get("total") or 0,
+                    saves=gk.get("saves") or 0,
+                    yellow_cards=cards_s.get("yellow") or 0,
+                    red_cards=cards_s.get("red") or 0,
+                ))
+        return players
+
+    def get_odds(self, fixture_id: int) -> list[BookmakerOdds]:
+        results = self._get("/odds", {"fixture": fixture_id, "bet": 1}, "odds")
+        bookmakers = []
+        for r in results:
+            for bm in r.get("bookmakers", []):
+                for bet in bm.get("bets", []):
+                    if bet.get("name") == "Match Winner":
+                        vals = {v["value"]: v["odd"] for v in bet.get("values", [])}
+                        bookmakers.append(BookmakerOdds(
+                            bookmaker=bm.get("name", ""),
+                            home=vals.get("Home", "?"),
+                            draw=vals.get("Draw", "?"),
+                            away=vals.get("Away", "?"),
+                        ))
+        return bookmakers[:5]
+
+    def get_topassists(self, limit: int = 10) -> list[PlayerStat]:
+        results = self._get(
+            "/players/topassists",
+            {"league": self.league_id, "season": self.season},
+            "topassists",
+        )
+        players = []
+        for r in results[:limit]:
+            p = r.get("player", {})
+            stats = (r.get("statistics") or [{}])[0]
+            games = stats.get("games", {})
+            goals = stats.get("goals", {})
+            shots = stats.get("shots", {})
+            passes = stats.get("passes", {})
+            cards = stats.get("cards", {})
+            players.append(PlayerStat(
+                player_id=p.get("id", 0),
+                name=p.get("name", ""),
+                appearances=games.get("appearences") or 0,
+                minutes=games.get("minutes") or 0,
+                goals=goals.get("total") or 0,
+                assists=goals.get("assists") or 0,
+                shots_on=shots.get("on") or 0,
+                key_passes=passes.get("key") or 0,
+                rating=games.get("rating"),
+                yellow_cards=cards.get("yellow") or 0,
+                red_cards=cards.get("red") or 0,
+            ))
+        return players
+
+    def get_top_yellowcards(self, limit: int = 10) -> list[PlayerStat]:
+        results = self._get(
+            "/players/topyellowcards",
+            {"league": self.league_id, "season": self.season},
+            "topyellowcards",
+        )
+        players = []
+        for r in results[:limit]:
+            p = r.get("player", {})
+            stats = (r.get("statistics") or [{}])[0]
+            games = stats.get("games", {})
+            goals = stats.get("goals", {})
+            shots = stats.get("shots", {})
+            passes = stats.get("passes", {})
+            cards = stats.get("cards", {})
+            players.append(PlayerStat(
+                player_id=p.get("id", 0),
+                name=p.get("name", ""),
+                appearances=games.get("appearences") or 0,
+                minutes=games.get("minutes") or 0,
+                goals=goals.get("total") or 0,
+                assists=goals.get("assists") or 0,
+                shots_on=shots.get("on") or 0,
+                key_passes=passes.get("key") or 0,
+                rating=games.get("rating"),
+                yellow_cards=cards.get("yellow") or 0,
+                red_cards=cards.get("red") or 0,
+            ))
+        return players
+
     def get_predictions(self, fixture_id: int) -> Optional[ApiPrediction]:
         results = self._get("/predictions", {"fixture": fixture_id}, "predictions")
         if not results:
@@ -290,10 +525,43 @@ class FootballAPI:
         winner = preds.get("winner") or {}
         percent = preds.get("percent") or {}
         goals = preds.get("goals") or {}
+        teams = r.get("teams", {})
+
+        def parse_last5(t: dict) -> Optional[Last5]:
+            l5 = t.get("last_5") or {}
+            if not l5:
+                return None
+            gf = l5.get("goals", {}).get("for", {})
+            ga = l5.get("goals", {}).get("against", {})
+            return Last5(
+                form_pct=l5.get("form") or "?",
+                att_pct=l5.get("att") or "?",
+                def_pct=l5.get("def") or "?",
+                goals_for_avg=gf.get("average") or "?",
+                goals_against_avg=ga.get("average") or "?",
+                goals_for_total=gf.get("total") or 0,
+                goals_against_total=ga.get("total") or 0,
+            )
+
+        def parse_uo(t: dict) -> Optional[UnderOver]:
+            uo = (t.get("league") or {}).get("goals", {}).get("for", {}).get("under_over") or {}
+            if not uo:
+                return None
+            def g(line, key): return (uo.get(line) or {}).get(key) or 0
+            return UnderOver(
+                over_0_5=g("0.5","over"), under_0_5=g("0.5","under"),
+                over_1_5=g("1.5","over"), under_1_5=g("1.5","under"),
+                over_2_5=g("2.5","over"), under_2_5=g("2.5","under"),
+                over_3_5=g("3.5","over"), under_3_5=g("3.5","under"),
+                over_4_5=g("4.5","over"), under_4_5=g("4.5","under"),
+            )
+
+        def c(key, side): return comp.get(key, {}).get(side) or "?"
 
         return ApiPrediction(
             winner_name=winner.get("name"),
             winner_comment=winner.get("comment"),
+            win_or_draw=preds.get("win_or_draw") or False,
             advice=preds.get("advice") or "",
             home_percent=percent.get("home") or "?",
             draw_percent=percent.get("draw") or "?",
@@ -301,12 +569,22 @@ class FootballAPI:
             under_over=preds.get("under_over"),
             goals_home=goals.get("home"),
             goals_away=goals.get("away"),
-            form_home=comp.get("form", {}).get("home") or "?",
-            form_away=comp.get("form", {}).get("away") or "?",
-            att_home=comp.get("att", {}).get("home") or "?",
-            att_away=comp.get("att", {}).get("away") or "?",
-            def_home=comp.get("def", {}).get("home") or "?",
-            def_away=comp.get("def", {}).get("away") or "?",
-            total_home=comp.get("total", {}).get("home") or "?",
-            total_away=comp.get("total", {}).get("away") or "?",
+            form_home=c("form","home"),
+            form_away=c("form","away"),
+            att_home=c("att","home"),
+            att_away=c("att","away"),
+            def_home=c("def","home"),
+            def_away=c("def","away"),
+            poisson_home=c("poisson_distribution","home"),
+            poisson_away=c("poisson_distribution","away"),
+            h2h_home=c("h2h","home"),
+            h2h_away=c("h2h","away"),
+            goals_comp_home=c("goals","home"),
+            goals_comp_away=c("goals","away"),
+            total_home=c("total","home"),
+            total_away=c("total","away"),
+            last_5_home=parse_last5(teams.get("home") or {}),
+            last_5_away=parse_last5(teams.get("away") or {}),
+            home_under_over=parse_uo(teams.get("home") or {}),
+            away_under_over=parse_uo(teams.get("away") or {}),
         )

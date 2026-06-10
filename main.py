@@ -25,46 +25,55 @@ def _get_api() -> tuple:
     league_id = int(os.getenv("WC_LEAGUE_ID", "1"))
     season = int(os.getenv("WC_SEASON", "2026"))
 
+    model = os.getenv("OPENROUTER_MODEL")
     missing = []
     if not football_key:
         missing.append("FOOTBALL_API_KEY")
     if not openrouter_key:
         missing.append("OPENROUTER_API_KEY")
+    if not model:
+        missing.append("OPENROUTER_MODEL")
     if missing:
         console.print(f"[red]Missing env vars: {', '.join(missing)}[/red]")
         console.print("Copy [bold].env.example[/bold] to [bold].env[/bold] and fill in your keys.")
         raise typer.Exit(1)
 
     from api.football import FootballAPI
-    model = os.getenv("OPENROUTER_MODEL")
-    if not model:
-        missing.append("OPENROUTER_MODEL")
     return FootballAPI(football_key, league_id=league_id, season=season), openrouter_key, model
 
 
-def _resolve_team(api, name: str) -> Optional[object]:
-    from api.models import Team
+def _resolve_team(api, name_or_id: str) -> Optional[object]:
+    # Numeric input → treat as team ID directly
+    if name_or_id.isdigit():
+        team_id = int(name_or_id)
+        with console.status(f"Fetching team ID {team_id}..."):
+            team = api.get_team_by_id(team_id)
+        if not team:
+            console.print(f"[red]No team found with ID {team_id}.[/red]")
+            return None
+        console.print(f"  [green]✓[/green] Found: [bold]{team.name}[/bold] (ID {team.id})")
+        return team
 
-    with console.status(f"Searching for [bold]{name}[/bold]..."):
-        results = api.search_team(name)
+    with console.status(f"Searching for [bold]{name_or_id}[/bold]..."):
+        results = api.search_team(name_or_id)
 
     if not results:
-        console.print(f"[red]No team found matching '{name}'.[/red]")
-        console.print("Tip: try a shorter name or the official English name (e.g. 'Morocco', 'United States').")
+        console.print(f"[red]No team found matching '{name_or_id}'.[/red]")
+        console.print("Tip: pass the numeric team ID directly, or try a shorter/official name.")
         return None
 
     if len(results) == 1:
         console.print(f"  [green]✓[/green] Found: [bold]{results[0].name}[/bold] (ID {results[0].id})")
         return results[0]
 
-    # Multiple results — show options and pick the first plausible national team
+    # Multiple results — prefer national teams (short code)
     national = [t for t in results if t.code and len(t.code) <= 3]
     if national:
         team = national[0]
         console.print(f"  [green]✓[/green] Found: [bold]{team.name}[/bold] (ID {team.id})")
         return team
 
-    console.print(f"\n[yellow]Multiple matches for '{name}':[/yellow]")
+    console.print(f"\n[yellow]Multiple matches for '{name_or_id}' — pick one or re-run with the ID:[/yellow]")
     table = Table(box=box.SIMPLE)
     table.add_column("#", style="dim")
     table.add_column("Team")
@@ -190,12 +199,25 @@ def analyze(
         standings = api.get_standings()
     console.print(f"  [green]✓[/green] Standings: {len(standings)} entries" if standings else f"  [yellow]·[/yellow] Standings: not yet available")
 
+    with console.status(f"Fetching {t1.name} player stats..."):
+        t1_players = api.get_player_stats(t1.id)
+    console.print(f"  [green]✓[/green] {t1.name} players: {len(t1_players)} with stats" if t1_players else f"  [yellow]·[/yellow] {t1.name} player stats: not yet available")
+
+    with console.status(f"Fetching {t2.name} player stats..."):
+        t2_players = api.get_player_stats(t2.id)
+    console.print(f"  [green]✓[/green] {t2.name} players: {len(t2_players)} with stats" if t2_players else f"  [yellow]·[/yellow] {t2.name} player stats: not yet available")
+
+    with console.status("Fetching tournament top scorers..."):
+        top_scorers = api.get_top_scorers()
+    console.print(f"  [green]✓[/green] Top scorers: {len(top_scorers)} players" if top_scorers else f"  [yellow]·[/yellow] Top scorers: not yet available")
+
     with console.status("Looking for scheduled WC fixture..."):
         fixture = api.find_wc_fixture(t1.id, t2.id)
 
     injuries = []
     lineups = []
     api_prediction = None
+    fixture_stats = []
 
     if fixture:
         console.print(f"  [green]✓[/green] WC fixture found: {fixture.home_team.name} vs {fixture.away_team.name} — {fixture.round} ({fixture.date[:10]})")
@@ -211,8 +233,45 @@ def analyze(
         with console.status("Fetching API prediction..."):
             api_prediction = api.get_predictions(fixture.fixture_id)
         console.print(f"  [green]✓[/green] API prediction: available" if api_prediction else f"  [yellow]·[/yellow] API prediction: not available")
+
+        if fixture.status == "FT":
+            with console.status("Fetching match statistics..."):
+                fixture_stats = api.get_fixture_stats(fixture.fixture_id)
+            console.print(f"  [green]✓[/green] Match statistics: available" if fixture_stats else f"  [yellow]·[/yellow] Match statistics: not available")
     else:
         console.print(f"  [yellow]·[/yellow] No scheduled WC fixture found between these teams")
+
+    with console.status("Fetching match events for form analysis..."):
+        form_events: dict[int, list] = {}
+        for m in t1_form + t2_form:
+            if m.home_goals is not None:
+                form_events[m.fixture_id] = api.get_fixture_events(m.fixture_id)
+    event_count = sum(len(v) for v in form_events.values())
+    console.print(f"  [green]✓[/green] Form events: {event_count} events across {len(form_events)} matches")
+
+    with console.status("Fetching tournament top assists..."):
+        top_assists = api.get_topassists()
+    console.print(f"  [green]✓[/green] Top assists: {len(top_assists)} players" if top_assists else f"  [yellow]·[/yellow] Top assists: not yet available")
+
+    with console.status("Fetching disciplinary leaders..."):
+        top_yellowcards = api.get_top_yellowcards()
+    console.print(f"  [green]✓[/green] Yellow card leaders: {len(top_yellowcards)} players" if top_yellowcards else f"  [yellow]·[/yellow] Yellow card leaders: not yet available")
+
+    odds = []
+    wc_events = []
+    fixture_players = []
+    if fixture:
+        with console.status("Fetching pre-match odds..."):
+            odds = api.get_odds(fixture.fixture_id)
+        console.print(f"  [green]✓[/green] Odds: {len(odds)} bookmaker(s)" if odds else f"  [yellow]·[/yellow] Odds: not available")
+
+        with console.status("Fetching fixture events..."):
+            wc_events = api.get_fixture_events(fixture.fixture_id)
+        console.print(f"  [green]✓[/green] Fixture events: {len(wc_events)} events" if wc_events else f"  [yellow]·[/yellow] Fixture events: none yet")
+
+        with console.status("Fetching fixture player stats..."):
+            fixture_players = api.get_fixture_players(fixture.fixture_id)
+        console.print(f"  [green]✓[/green] Fixture player stats: {len(fixture_players)} players" if fixture_players else f"  [yellow]·[/yellow] Fixture player stats: not available")
 
     console.print()
 
@@ -222,6 +281,16 @@ def analyze(
         team2_stats=t2_stats,
         standings=standings or None,
         api_prediction=api_prediction,
+        team1_players=t1_players or None,
+        team2_players=t2_players or None,
+        top_scorers=top_scorers or None,
+        fixture_stats=fixture_stats or None,
+        form_events=form_events or None,
+        odds=odds or None,
+        top_assists=top_assists or None,
+        top_yellowcards=top_yellowcards or None,
+        wc_events=wc_events or None,
+        fixture_players=fixture_players or None,
     )
 
     console.print(f"[dim]Sending data to {model} for analysis...[/dim]")
@@ -232,6 +301,13 @@ def analyze(
     report_path = save_report(
         t1, t2, t1_form, t2_form, h2h, injuries, lineups, fixture,
         t1_stats, t2_stats, standings or None, api_prediction, ai_analysis, model,
+        t1_players or None, t2_players or None, top_scorers or None, fixture_stats or None,
+        form_events=form_events or None,
+        odds=odds or None,
+        top_assists=top_assists or None,
+        top_yellowcards=top_yellowcards or None,
+        wc_events=wc_events or None,
+        fixture_players=fixture_players or None,
     )
     console.print(f"\n[green]✓[/green] Report saved: [bold]{report_path}[/bold]")
 

@@ -4,7 +4,7 @@ from openai import OpenAI
 from rich.console import Console
 from rich.rule import Rule
 
-from api.models import ApiPrediction, Injury, MatchResult, StandingsEntry, Team, TeamLineup, TeamStats, WCFixture
+from api.models import ApiPrediction, BookmakerOdds, FixtureEvent, FixturePlayerStat, FixtureTeamStat, Injury, Last5, MatchResult, PlayerStat, StandingsEntry, Team, TeamLineup, TeamStats, WCFixture
 
 console = Console()
 
@@ -18,6 +18,10 @@ Rules:
 - Be direct and specific — reference the actual scorelines and statistics provided.
 - Identify the single key tactical battle that will decide the match.
 - Acknowledge genuine uncertainty; do not manufacture false confidence.
+- When an API-Football prediction is provided, treat it as a data input alongside all other \
+evidence — synthesize it with your own analysis rather than deferring to it blindly. \
+Explicitly flag where your view agrees or diverges.
+- When pre-match odds are provided, treat them as a market-consensus calibration signal.
 - Keep each section concise — no padding or filler.
 
 Structure your response with exactly these sections:
@@ -27,16 +31,39 @@ Structure your response with exactly these sections:
 ## Players to Watch
 ## Injury Impact
 ## Prediction
-The Prediction section must include: winner (or draw), scoreline, confidence 1-10, and 2-3 sentences of reasoning.
+
+The Prediction section must end with a single "Best Bet" — one specific recommendation \
+(e.g. "Argentina -1 Asian handicap", "Under 2.5 goals", "Both teams to score: No") \
+that you have the highest conviction in given all available data, followed by your \
+confidence rating (X/10) and 2-3 sentences explaining why this is the value pick.
 """
 
 
-def _format_form(team: Team, matches: list[MatchResult]) -> str:
+def _format_form(team: Team, matches: list[MatchResult], events: Optional[dict[int, list[FixtureEvent]]] = None) -> str:
     if not matches:
         return f"{team.name}: No recent match data available.\n"
     lines = [f"{team.name} — Last {len(matches)} matches:"]
     for m in matches:
         lines.append(f"  {m.format_for_team(team.id)}")
+        if not events or m.fixture_id not in events:
+            continue
+        fevents = events[m.fixture_id]
+        team_goals = [e for e in fevents if e.type == "Goal" and e.team.id == team.id and "Own" not in e.detail]
+        opp_goals  = [e for e in fevents if e.type == "Goal" and e.team.id != team.id and "Own" not in e.detail]
+        reds       = [e for e in fevents if e.type == "Card" and "Red" in e.detail]
+        goal_parts = []
+        if team_goals:
+            g = [f"{e.player} {e.minute}'" + (" pen" if "Penalty" in e.detail else "") for e in team_goals]
+            goal_parts.append(f"{team.name}: {', '.join(g)}")
+        if opp_goals:
+            opp = m.away_team.name if m.home_team.id == team.id else m.home_team.name
+            g = [f"{e.player} {e.minute}'" + (" pen" if "Penalty" in e.detail else "") for e in opp_goals]
+            goal_parts.append(f"{opp}: {', '.join(g)}")
+        if goal_parts:
+            lines.append(f"    Goals: {' | '.join(goal_parts)}")
+        if reds:
+            red_strs = [f"{e.team.name}: {e.player} {e.minute}'" for e in reds]
+            lines.append(f"    Red cards: {', '.join(red_strs)}")
     return "\n".join(lines)
 
 
@@ -74,7 +101,7 @@ def _format_injuries(injuries: list[Injury], team1_name: str, team2_name: str) -
     t1 = [i for i in injuries if i.team_name == team1_name]
     t2 = [i for i in injuries if i.team_name == team2_name]
     if not t1 and not t2:
-        return "Injuries: None reported for this fixture.\n"
+        return ""
     lines = ["Injury Report:"]
     for team_name, team_injuries in [(team1_name, t1), (team2_name, t2)]:
         if team_injuries:
@@ -86,7 +113,7 @@ def _format_injuries(injuries: list[Injury], team1_name: str, team2_name: str) -
 
 def _format_lineups(lineups: list[TeamLineup]) -> str:
     if not lineups:
-        return "Lineups: Not yet announced.\n"
+        return ""
     lines = ["Confirmed Lineups:"]
     for lu in lineups:
         lines.append(f"  {lu.team.name} [{lu.formation}] — Coach: {lu.coach}")
@@ -101,7 +128,7 @@ def _format_lineups(lineups: list[TeamLineup]) -> str:
 
 def _format_team_stats(stats: Optional[TeamStats]) -> str:
     if not stats:
-        return "Tournament stats: Not yet available.\n"
+        return ""
     lines = [
         f"{stats.team.name} — Tournament Stats:",
         f"  Record: {stats.wins}W / {stats.draws}D / {stats.losses}L ({stats.played} played)",
@@ -139,22 +166,166 @@ def _format_standings(team: Team, entries: list[StandingsEntry]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_last5(l5: Optional[Last5], name: str) -> str:
+    if not l5:
+        return ""
+    return (
+        f"{name} last-5 ratings: form {l5.form_pct} / attack {l5.att_pct} / defense {l5.def_pct} | "
+        f"goals scored {l5.goals_for_avg}/game ({l5.goals_for_total} total) | "
+        f"goals conceded {l5.goals_against_avg}/game ({l5.goals_against_total} total)"
+    )
+
+
 def _format_prediction(pred: Optional[ApiPrediction], home_name: str, away_name: str) -> str:
     if not pred:
         return "API Prediction: Not available for this fixture.\n"
     lines = [
         "API-Football Prediction:",
         f"  Advice: {pred.advice}",
-        f"  Win probabilities: {home_name} {pred.home_percent} / Draw {pred.draw_percent} / {away_name} {pred.away_percent}",
+        f"  Winner: {pred.winner_name or '?'} ({pred.winner_comment or ''})"
+        + (" — win or draw" if pred.win_or_draw else ""),
+        f"  1X2 probabilities: {home_name} {pred.home_percent} / Draw {pred.draw_percent} / {away_name} {pred.away_percent}",
     ]
-    if pred.under_over:
-        lines.append(f"  Expected goals: {pred.under_over}  (home {pred.goals_home}, away {pred.goals_away})")
+    if pred.goals_home or pred.goals_away:
+        lines.append(f"  Expected goals: home {pred.goals_home or '?'} / away {pred.goals_away or '?'}"
+                     + (f" (line: {pred.under_over})" if pred.under_over else ""))
+
+    if pred.home_under_over:
+        uo = pred.home_under_over
+        lines.append(
+            f"  {home_name} games over/under (this season): "
+            f"o0.5={uo.over_0_5} o1.5={uo.over_1_5} o2.5={uo.over_2_5} o3.5={uo.over_3_5} o4.5={uo.over_4_5}"
+        )
+    if pred.away_under_over:
+        uo = pred.away_under_over
+        lines.append(
+            f"  {away_name} games over/under (this season): "
+            f"o0.5={uo.over_0_5} o1.5={uo.over_1_5} o2.5={uo.over_2_5} o3.5={uo.over_3_5} o4.5={uo.over_4_5}"
+        )
+
     lines.append(
-        f"  Comparison: Form {pred.form_home}/{pred.form_away} | "
-        f"Attack {pred.att_home}/{pred.att_away} | "
-        f"Defense {pred.def_home}/{pred.def_away} | "
-        f"Overall {pred.total_home}/{pred.total_away}"
+        f"  Comparison — Form: {pred.form_home}/{pred.form_away} | "
+        f"Attack: {pred.att_home}/{pred.att_away} | "
+        f"Defense: {pred.def_home}/{pred.def_away} | "
+        f"Poisson: {pred.poisson_home}/{pred.poisson_away} | "
+        f"H2H: {pred.h2h_home}/{pred.h2h_away} | "
+        f"Goals: {pred.goals_comp_home}/{pred.goals_comp_away} | "
+        f"Overall: {pred.total_home}/{pred.total_away}"
     )
+    if pred.last_5_home:
+        lines.append(f"  {_fmt_last5(pred.last_5_home, home_name)}")
+    if pred.last_5_away:
+        lines.append(f"  {_fmt_last5(pred.last_5_away, away_name)}")
+
+    return "\n".join(lines)
+
+
+def _format_player_stats(players: list[PlayerStat], team: Team) -> str:
+    if not players:
+        return ""
+    lines = [f"{team.name} — Top contributors (tournament):"]
+    lines.append(f"  {'Name':<25} {'Apps':>4} {'Min':>5} {'Gls':>4} {'Ast':>4} {'SoT':>4} {'KP':>4} {'Rating':>7}")
+    lines.append(f"  {'-'*25} {'----':>4} {'-----':>5} {'---':>4} {'---':>4} {'---':>4} {'--':>4} {'------':>7}")
+    for p in players[:8]:
+        rating = p.rating or "—"
+        lines.append(
+            f"  {p.name:<25} {p.appearances:>4} {p.minutes:>5} "
+            f"{p.goals:>4} {p.assists:>4} {p.shots_on:>4} {p.key_passes:>4} {rating:>7}"
+        )
+    return "\n".join(lines)
+
+
+def _format_top_scorers(players: list[PlayerStat]) -> str:
+    if not players:
+        return ""
+    lines = ["Tournament top scorers:"]
+    for i, p in enumerate(players[:10], 1):
+        lines.append(f"  {i:>2}. {p.name:<25} {p.goals}G {p.assists}A")
+    return "\n".join(lines)
+
+
+def _format_fixture_stats(stats: list[FixtureTeamStat]) -> str:
+    if not stats or len(stats) < 2:
+        return ""
+    a, b = stats[0], stats[1]
+    lines = [f"Match statistics — {a.team.name} vs {b.team.name}:"]
+    def row(label, va, vb):
+        return f"  {label:<20} {str(va or '—'):>8}   {str(vb or '—'):>8}"
+    lines.append(row("Possession", a.possession, b.possession))
+    lines.append(row("Shots (total)", a.shots_total, b.shots_total))
+    lines.append(row("Shots on target", a.shots_on, b.shots_on))
+    lines.append(row("Corners", a.corners, b.corners))
+    lines.append(row("Passes", a.passes_total, b.passes_total))
+    lines.append(row("Pass accuracy", a.pass_accuracy, b.pass_accuracy))
+    lines.append(row("Fouls", a.fouls, b.fouls))
+    lines.append(row("Offsides", a.offsides, b.offsides))
+    lines.append(row("Saves", a.saves, b.saves))
+    return "\n".join(lines)
+
+
+def _format_odds(odds: list[BookmakerOdds], home_name: str, away_name: str) -> str:
+    if not odds:
+        return ""
+    lines = [f"Pre-match odds — {home_name} / Draw / {away_name}:"]
+    for o in odds[:4]:
+        lines.append(f"  {o.bookmaker}: {o.home} / {o.draw} / {o.away}")
+    return "\n".join(lines)
+
+
+def _format_topassists(players: list[PlayerStat]) -> str:
+    if not players:
+        return ""
+    lines = ["Tournament top assists:"]
+    for i, p in enumerate(players[:8], 1):
+        lines.append(f"  {i:>2}. {p.name:<25} {p.assists}A {p.goals}G")
+    return "\n".join(lines)
+
+
+def _format_top_yellowcards(players: list[PlayerStat]) -> str:
+    if not players:
+        return ""
+    lines = ["Yellow card leaders (suspension risk):"]
+    for i, p in enumerate(players[:8], 1):
+        lines.append(f"  {i:>2}. {p.name:<25} {p.yellow_cards}Y {p.red_cards}R  ({p.appearances} apps)")
+    return "\n".join(lines)
+
+
+def _format_wc_events(events: list[FixtureEvent]) -> str:
+    goals = [e for e in events if e.type == "Goal"]
+    reds  = [e for e in events if e.type == "Card" and "Red" in e.detail]
+    if not goals and not reds:
+        return ""
+    lines = ["Match events (chronological):"]
+    for e in sorted(goals + reds, key=lambda x: x.minute):
+        mins = f"{e.minute}'" + (f"+{e.extra_minute}" if e.extra_minute else "")
+        if e.type == "Goal":
+            own = " (OG)" if "Own" in e.detail else ""
+            pen = " (pen)" if "Penalty" in e.detail else ""
+            assist = f", assist: {e.assist}" if e.assist else ""
+            lines.append(f"  {mins}  GOAL  {e.player}{own}{pen}{assist}  [{e.team.name}]")
+        else:
+            card = "Red card" if e.detail == "Red Card" else "2nd Yellow→Red"
+            lines.append(f"  {mins}  {card}  {e.player}  [{e.team.name}]")
+    return "\n".join(lines)
+
+
+def _format_fixture_players(players: list[FixturePlayerStat], team1: Team, team2: Team) -> str:
+    t1 = sorted([p for p in players if p.team.id == team1.id and p.minutes > 0],
+                key=lambda p: float(p.rating or 0), reverse=True)
+    t2 = sorted([p for p in players if p.team.id == team2.id and p.minutes > 0],
+                key=lambda p: float(p.rating or 0), reverse=True)
+    if not t1 and not t2:
+        return ""
+    lines = ["Player ratings from this fixture:"]
+    for team, tplayers in [(team1, t1[:6]), (team2, t2[:6])]:
+        if tplayers:
+            lines.append(f"  {team.name}:")
+            for p in tplayers:
+                rating = p.rating or "—"
+                lines.append(
+                    f"    {p.name:<25} {rating:>5} | {p.minutes}' | "
+                    f"{p.goals}G {p.assists}A {p.shots_on}SoT {p.tackles}tkl"
+                )
     return "\n".join(lines)
 
 
@@ -171,6 +342,16 @@ def build_prompt(
     team2_stats: Optional[TeamStats] = None,
     standings: Optional[list[StandingsEntry]] = None,
     api_prediction: Optional[ApiPrediction] = None,
+    team1_players: Optional[list[PlayerStat]] = None,
+    team2_players: Optional[list[PlayerStat]] = None,
+    top_scorers: Optional[list[PlayerStat]] = None,
+    fixture_stats: Optional[list[FixtureTeamStat]] = None,
+    form_events: Optional[dict[int, list[FixtureEvent]]] = None,
+    odds: Optional[list[BookmakerOdds]] = None,
+    top_assists: Optional[list[PlayerStat]] = None,
+    top_yellowcards: Optional[list[PlayerStat]] = None,
+    wc_events: Optional[list[FixtureEvent]] = None,
+    fixture_players: Optional[list[FixturePlayerStat]] = None,
 ) -> str:
     if fixture:
         context = (
@@ -186,19 +367,52 @@ def build_prompt(
             "(No scheduled fixture found — analyzing based on available data)\n"
         )
 
+    home_name = fixture.home_team.name if fixture else team1.name
+    away_name = fixture.away_team.name if fixture else team2.name
+
     sections = [
         "Please analyze this World Cup 2026 match and provide your prediction.\n",
         "## Match Context",
         context,
-        "## Tournament Statistics",
-        _format_team_stats(team1_stats),
-        "",
-        _format_team_stats(team2_stats),
-        "",
+    ]
+
+    # Tournament stats — only include teams that have data
+    t1_stats_str = _format_team_stats(team1_stats)
+    t2_stats_str = _format_team_stats(team2_stats)
+    if t1_stats_str or t2_stats_str:
+        sections.append("## Tournament Statistics")
+        if t1_stats_str:
+            sections += [t1_stats_str, ""]
+        if t2_stats_str:
+            sections += [t2_stats_str, ""]
+
+    # Player stats — only include teams that have data
+    t1_p_str = _format_player_stats(team1_players or [], team1)
+    t2_p_str = _format_player_stats(team2_players or [], team2)
+    if t1_p_str or t2_p_str:
+        sections.append("## Player Statistics (Tournament)")
+        if t1_p_str:
+            sections += [t1_p_str, ""]
+        if t2_p_str:
+            sections += [t2_p_str, ""]
+
+    ts_str = _format_top_scorers(top_scorers or [])
+    if ts_str:
+        sections += ["## " + ts_str, ""]
+
+    ta_str = _format_topassists(top_assists or [])
+    if ta_str:
+        sections += ["## " + ta_str, ""]
+
+    ty_str = _format_top_yellowcards(top_yellowcards or [])
+    if ty_str:
+        sections += ["## " + ty_str, ""]
+
+    sections += [
         "## Recent Form (last matches across all competitions)",
-        _format_form(team1, team1_form),
+        _format_form(team1, team1_form, form_events),
         "",
-        _format_form(team2, team2_form),
+        _format_form(team2, team2_form, form_events),
         "",
         "## Head-to-Head",
         _format_h2h(team1, team2, h2h),
@@ -214,14 +428,35 @@ def build_prompt(
             "",
         ]
 
-    sections += [
-        "## " + _format_injuries(injuries, team1.name, team2.name),
-        "",
-        "## Lineups",
-        _format_lineups(lineups),
-        "",
-        "## " + _format_prediction(api_prediction, fixture.home_team.name if fixture else team1.name, fixture.away_team.name if fixture else team2.name),
-    ]
+    fixture_stats_str = _format_fixture_stats(fixture_stats or [])
+    if fixture_stats_str:
+        sections += ["## Match Statistics", fixture_stats_str, ""]
+
+    if wc_events:
+        wc_events_str = _format_wc_events(wc_events)
+        if wc_events_str:
+            sections += ["## " + wc_events_str, ""]
+
+    if fixture_players:
+        fp_str = _format_fixture_players(fixture_players, team1, team2)
+        if fp_str:
+            sections += ["## " + fp_str, ""]
+
+    inj_str = _format_injuries(injuries, team1.name, team2.name)
+    if inj_str:
+        sections += ["## " + inj_str, ""]
+
+    lu_str = _format_lineups(lineups)
+    if lu_str:
+        sections += ["## Lineups", lu_str, ""]
+
+    odds_str = _format_odds(odds or [], home_name, away_name)
+    if odds_str:
+        sections += ["## " + odds_str, ""]
+
+    if api_prediction:
+        sections += ["## " + _format_prediction(api_prediction, home_name, away_name)]
+
     return "\n".join(sections)
 
 
