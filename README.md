@@ -2,7 +2,7 @@
 
 AI-powered match analysis and prediction for the FIFA World Cup 2026.
 
-Pulls live data from API-Football (form, head-to-head, standings, injuries, lineups) and streams a structured analysis via any model on OpenRouter.
+Pulls live data from API-Football across multiple endpoints and streams a structured analysis via any model on OpenRouter, saving a self-contained HTML report per match.
 
 ---
 
@@ -49,12 +49,15 @@ uv sync
 # List upcoming fixtures
 uv run python main.py fixtures
 
-# Analyze a match
+# Analyze a match (team name or numeric ID)
 uv run python main.py analyze "Mexico" "South Africa"
+uv run python main.py analyze 16 1531
 
 # Search for a team name / ID
 uv run python main.py search "Korea"
 ```
+
+> **Tip:** If a team name search resolves to a club instead of a national team, use the numeric ID directly. Run `search` to find it, or look it up from the `fixtures` output.
 
 ### Options
 
@@ -72,15 +75,39 @@ Each `analyze` run saves a self-contained HTML report to `results/`.
 
 ## Data sources
 
-Each analysis includes:
+Each analysis pulls from the following API-Football endpoints:
 
-- **Tournament statistics** — record, goals, clean sheets, form, preferred formation
-- **Recent form** — last N matches across all competitions
-- **Head-to-head** — historical record between the two sides
-- **Group standings** — current table with GD and form
-- **Injuries** — reported absences for the specific fixture
-- **Lineups** — confirmed starting XIs (available ~40 min before kickoff)
-- **API prediction** — win/draw/loss probabilities and comparison metrics from API-Football
+| Data | What it provides |
+|---|---|
+| Tournament statistics | Record, goals, clean sheets, form string, preferred formation |
+| Player statistics | Per-player goals, assists, shots on target, key passes, rating |
+| Top scorers | Tournament goals leaderboard |
+| Top assists | Tournament assists leaderboard |
+| Disciplinary leaders | Yellow/red card counts — flags suspension risks |
+| Recent form | Last N matches with inline goal scorers, minutes, and red cards |
+| Head-to-head | Historical record between the two sides |
+| Group standings | Current table with GD and rolling form |
+| Injuries | Reported absences for the specific fixture |
+| Lineups | Confirmed starting XIs (available ~40 min before kickoff) |
+| Match events | Chronological goal/card timeline for the fixture |
+| Fixture player ratings | Per-player ratings and stats from the specific match |
+| Pre-match odds | 1X2 odds from up to 5 bookmakers |
+| API prediction | Win/draw/loss probabilities and comparison metrics |
+
+Sections are skipped entirely when data is unavailable — no placeholder output is generated.
+
+---
+
+## AI analysis
+
+The AI receives all available data and produces a structured report covering:
+
+- **Form & Momentum**
+- **Head-to-Head**
+- **Key Tactical Battle**
+- **Players to Watch**
+- **Injury Impact**
+- **Prediction** — synthesizes the API-Football prediction with its own analysis, ending with a single high-conviction **Best Bet** recommendation and confidence rating
 
 ---
 
@@ -91,8 +118,8 @@ API responses are cached in `cache/` to avoid redundant requests. TTLs:
 | Data | TTL |
 |---|---|
 | Fixtures / standings | 60 min |
-| Recent form / team stats | 30 min |
-| Injuries / lineups / predictions | 15 min |
+| Recent form / team stats / players | 30 min |
+| Injuries / lineups / predictions / odds / events | 15–60 min |
 | Teams / H2H | 24 h |
 
 Clear the cache manually with `rm -rf cache/`.
