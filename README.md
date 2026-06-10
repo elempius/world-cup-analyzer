@@ -55,7 +55,16 @@ uv run python main.py analyze 16 1531
 
 # Search for a team name / ID
 uv run python main.py search "Korea"
+
+# Analyze every fixture on a date (defaults to today, UTC)
+uv run python main.py analyze-day
+uv run python main.py analyze-day 2026-06-12
+
+# Show recorded predictions and how they fared
+uv run python main.py record
 ```
+
+> The package also installs a `wca` entry point, so `uv run wca fixtures` works too.
 
 > **Tip:** If a team name search resolves to a club instead of a national team, use the numeric ID directly. Run `search` to find it, or look it up from the `fixtures` output.
 
@@ -69,7 +78,13 @@ uv run python main.py analyze "Brazil" "France" --form 8   # last 8 matches per 
 uv run python main.py analyze "Brazil" "France" --h2h 15   # last 15 H2H matches
 ```
 
-Each `analyze` run saves a self-contained HTML report to `results/`.
+Each `analyze` run saves a self-contained HTML report to `results/`. Data is fetched concurrently (4 workers) with automatic retry on transient failures and rate limits; sections whose endpoints fail are skipped rather than aborting the run.
+
+---
+
+## Prediction tracking
+
+Every analysis appends its **Best Bet** and confidence to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet), with a running win/loss record. Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
 
 ---
 
@@ -122,4 +137,12 @@ API responses are cached in `cache/` to avoid redundant requests. TTLs:
 | Injuries / lineups / predictions / odds / events | 15–60 min |
 | Teams / H2H | 24 h |
 
-Clear the cache manually with `rm -rf cache/`.
+Error responses (rate limits, plan limits) are never cached. Clear the cache manually with `rm -rf cache/`.
+
+---
+
+## Development
+
+```bash
+uv run pytest
+```

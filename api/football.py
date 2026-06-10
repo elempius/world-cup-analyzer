@@ -26,6 +26,13 @@ from api.models import (
 
 CACHE_DIR = Path("cache")
 
+# Statuses meaning the match has been played to completion
+FINISHED_STATUSES = {"FT", "AET", "PEN"}
+
+
+class FootballAPIError(Exception):
+    """Request failure or an in-band error reported by API-Football."""
+
 CACHE_TTL = {
     "fixtures": 3600,
     "form": 1800,
@@ -79,11 +86,40 @@ class FootballAPI:
         cached = self._get_cached(key, CACHE_TTL[ttl_key])
         if cached is not None:
             return cached
-        resp = self.client.get(endpoint, params=params)
-        resp.raise_for_status()
-        data = resp.json().get("response", [])
+        data = self._fetch(endpoint, params)
         self._set_cache(key, data)
         return data
+
+    def _fetch(self, endpoint: str, params: dict, attempts: int = 3):
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(2 ** attempt)
+            try:
+                resp = self.client.get(endpoint, params=params)
+                resp.raise_for_status()
+            except httpx.HTTPError as e:
+                last_error = e
+                continue
+            body = resp.json()
+            # API-Football reports failures (rate limit, plan limits, bad
+            # params) with HTTP 200 and a non-empty "errors" field.
+            errors = body.get("errors")
+            if errors:
+                if isinstance(errors, dict):
+                    msg = "; ".join(f"{k}: {v}" for k, v in errors.items())
+                else:
+                    msg = "; ".join(str(e) for e in errors)
+                if "ratelimit" in msg.lower() or "too many requests" in msg.lower():
+                    # Per-minute quota; wait it out and retry
+                    last_error = FootballAPIError(f"{endpoint}: {msg}")
+                    time.sleep(8)
+                    continue
+                raise FootballAPIError(f"{endpoint}: {msg}")
+            return body.get("response", [])
+        raise FootballAPIError(
+            f"{endpoint}: request failed after {attempts} attempts ({last_error})"
+        )
 
     # --- Public methods ---
 
@@ -189,7 +225,7 @@ class FootballAPI:
         ]
 
     def get_lineups(self, fixture_id: int) -> list[TeamLineup]:
-        results = self._get("/lineups", {"fixture": fixture_id}, "lineups")
+        results = self._get("/fixtures/lineups", {"fixture": fixture_id}, "lineups")
         lineups = []
         for r in results:
             coach = r.get("coach", {}) or {}
@@ -221,11 +257,18 @@ class FootballAPI:
         return lineups
 
     def find_wc_fixture(self, team1_id: int, team2_id: int) -> Optional[WCFixture]:
-        for f in self.get_wc_fixtures():
-            ids = {f.home_team.id, f.away_team.id}
-            if ids == {team1_id, team2_id}:
-                return f
-        return None
+        matches = [
+            f for f in self.get_wc_fixtures()
+            if {f.home_team.id, f.away_team.id} == {team1_id, team2_id}
+        ]
+        if not matches:
+            return None
+        # Teams can meet twice in a tournament: prefer the nearest unplayed
+        # fixture, otherwise the most recently played one.
+        unplayed = [f for f in matches if f.status not in FINISHED_STATUSES]
+        if unplayed:
+            return min(unplayed, key=lambda f: f.date)
+        return max(matches, key=lambda f: f.date)
 
     def get_team_stats(self, team_id: int) -> Optional[TeamStats]:
         results = self._get(

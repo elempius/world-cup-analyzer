@@ -1,5 +1,7 @@
+import functools
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -40,6 +42,28 @@ def _get_api() -> tuple:
 
     from api.football import FootballAPI
     return FootballAPI(football_key, league_id=league_id, season=season), openrouter_key, model
+
+
+def _handle_api_errors(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from api.football import FootballAPIError
+        try:
+            return fn(*args, **kwargs)
+        except FootballAPIError as e:
+            console.print(f"[red]API error: {e}[/red]")
+            raise typer.Exit(1)
+    return wrapper
+
+
+def _safe(fetch, default):
+    """Run a fetch, degrading to a default if the API call fails."""
+    from api.football import FootballAPIError
+    try:
+        return fetch()
+    except FootballAPIError as e:
+        console.print(f"  [yellow]![/yellow] Skipped ({e})")
+        return default
 
 
 def _resolve_team(api, name_or_id: str) -> Optional[object]:
@@ -93,6 +117,7 @@ def _resolve_team(api, name_or_id: str) -> Optional[object]:
 
 
 @app.command()
+@_handle_api_errors
 def fixtures(
     days: int = typer.Option(14, "-d", "--days", help="How many days ahead to display"),
     all: bool = typer.Option(False, "-a", "--all", help="Show all fixtures including finished"),
@@ -149,129 +174,100 @@ def fixtures(
     console.print(f"[dim]Showing {len(filtered)} fixture(s). Use --all to include all matches.[/dim]")
 
 
-@app.command()
-def analyze(
-    team1: str = typer.Argument(..., help="First team name"),
-    team2: str = typer.Argument(..., help="Second team name"),
-    form: int = typer.Option(5, "-f", "--form", help="Number of recent matches to fetch per team"),
-    h2h_count: int = typer.Option(10, "--h2h", help="Number of H2H matches to fetch"),
-):
-    """Analyze a matchup and predict the outcome using AI."""
-    api, openrouter_key, model = _get_api()
-
+def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_count: int):
+    """Fetch all data for a matchup, stream the AI analysis, and save the report."""
     from ai.analyzer import build_prompt, stream_analysis
 
-    # Resolve teams
-    console.print(Panel.fit("[bold cyan]World Cup 2026 — Match Analyzer[/bold cyan]"))
-    console.print()
+    with console.status("Fetching team and tournament data (parallel)..."):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = {
+                "t1_form": pool.submit(_safe, lambda: api.get_team_form(t1.id, last=form), []),
+                "t2_form": pool.submit(_safe, lambda: api.get_team_form(t2.id, last=form), []),
+                "t1_stats": pool.submit(_safe, lambda: api.get_team_stats(t1.id), None),
+                "t2_stats": pool.submit(_safe, lambda: api.get_team_stats(t2.id), None),
+                "h2h": pool.submit(_safe, lambda: api.get_h2h(t1.id, t2.id, last=h2h_count), []),
+                "standings": pool.submit(_safe, api.get_standings, []),
+                "t1_players": pool.submit(_safe, lambda: api.get_player_stats(t1.id), []),
+                "t2_players": pool.submit(_safe, lambda: api.get_player_stats(t2.id), []),
+                "top_scorers": pool.submit(_safe, api.get_top_scorers, []),
+                "top_assists": pool.submit(_safe, api.get_topassists, []),
+                "top_yellowcards": pool.submit(_safe, api.get_top_yellowcards, []),
+                "fixture": pool.submit(_safe, lambda: api.find_wc_fixture(t1.id, t2.id), None),
+            }
+            d = {name: job.result() for name, job in jobs.items()}
 
-    t1 = _resolve_team(api, team1)
-    if not t1:
-        raise typer.Exit(1)
-    t2 = _resolve_team(api, team2)
-    if not t2:
-        raise typer.Exit(1)
+    t1_form, t2_form = d["t1_form"], d["t2_form"]
+    t1_stats, t2_stats = d["t1_stats"], d["t2_stats"]
+    h2h, standings = d["h2h"], d["standings"]
+    t1_players, t2_players = d["t1_players"], d["t2_players"]
+    top_scorers, top_assists, top_yellowcards = d["top_scorers"], d["top_assists"], d["top_yellowcards"]
+    fixture = d["fixture"]
 
-    console.print()
-
-    # Fetch all data with status updates
-    with console.status(f"Fetching {t1.name} recent form..."):
-        t1_form = api.get_team_form(t1.id, last=form)
     console.print(f"  [green]✓[/green] {t1.name}: {len(t1_form)} recent matches")
-
-    with console.status(f"Fetching {t2.name} recent form..."):
-        t2_form = api.get_team_form(t2.id, last=form)
     console.print(f"  [green]✓[/green] {t2.name}: {len(t2_form)} recent matches")
-
-    with console.status(f"Fetching {t1.name} tournament stats..."):
-        t1_stats = api.get_team_stats(t1.id)
     console.print(f"  [green]✓[/green] {t1.name} stats: {'available' if t1_stats else 'not yet available'}")
-
-    with console.status(f"Fetching {t2.name} tournament stats..."):
-        t2_stats = api.get_team_stats(t2.id)
     console.print(f"  [green]✓[/green] {t2.name} stats: {'available' if t2_stats else 'not yet available'}")
-
-    with console.status("Fetching head-to-head history..."):
-        h2h = api.get_h2h(t1.id, t2.id, last=h2h_count)
     console.print(f"  [green]✓[/green] H2H: {len(h2h)} historical meetings found")
-
-    with console.status("Fetching group standings..."):
-        standings = api.get_standings()
     console.print(f"  [green]✓[/green] Standings: {len(standings)} entries" if standings else f"  [yellow]·[/yellow] Standings: not yet available")
-
-    with console.status(f"Fetching {t1.name} player stats..."):
-        t1_players = api.get_player_stats(t1.id)
     console.print(f"  [green]✓[/green] {t1.name} players: {len(t1_players)} with stats" if t1_players else f"  [yellow]·[/yellow] {t1.name} player stats: not yet available")
-
-    with console.status(f"Fetching {t2.name} player stats..."):
-        t2_players = api.get_player_stats(t2.id)
     console.print(f"  [green]✓[/green] {t2.name} players: {len(t2_players)} with stats" if t2_players else f"  [yellow]·[/yellow] {t2.name} player stats: not yet available")
-
-    with console.status("Fetching tournament top scorers..."):
-        top_scorers = api.get_top_scorers()
     console.print(f"  [green]✓[/green] Top scorers: {len(top_scorers)} players" if top_scorers else f"  [yellow]·[/yellow] Top scorers: not yet available")
-
-    with console.status("Looking for scheduled WC fixture..."):
-        fixture = api.find_wc_fixture(t1.id, t2.id)
-
-    injuries = []
-    lineups = []
-    api_prediction = None
-    fixture_stats = []
+    console.print(f"  [green]✓[/green] Top assists: {len(top_assists)} players" if top_assists else f"  [yellow]·[/yellow] Top assists: not yet available")
+    console.print(f"  [green]✓[/green] Yellow card leaders: {len(top_yellowcards)} players" if top_yellowcards else f"  [yellow]·[/yellow] Yellow card leaders: not yet available")
 
     if fixture:
         console.print(f"  [green]✓[/green] WC fixture found: {fixture.home_team.name} vs {fixture.away_team.name} — {fixture.round} ({fixture.date[:10]})")
-
-        with console.status("Fetching injury report..."):
-            injuries = api.get_injuries(fixture.fixture_id)
-        console.print(f"  [green]✓[/green] Injuries: {len(injuries)} player(s) reported")
-
-        with console.status("Fetching lineups..."):
-            lineups = api.get_lineups(fixture.fixture_id)
-        console.print(f"  [green]✓[/green] Lineups: confirmed" if lineups else f"  [yellow]·[/yellow] Lineups: not yet announced")
-
-        with console.status("Fetching API prediction..."):
-            api_prediction = api.get_predictions(fixture.fixture_id)
-        console.print(f"  [green]✓[/green] API prediction: available" if api_prediction else f"  [yellow]·[/yellow] API prediction: not available")
-
-        if fixture.status == "FT":
-            with console.status("Fetching match statistics..."):
-                fixture_stats = api.get_fixture_stats(fixture.fixture_id)
-            console.print(f"  [green]✓[/green] Match statistics: available" if fixture_stats else f"  [yellow]·[/yellow] Match statistics: not available")
     else:
         console.print(f"  [yellow]·[/yellow] No scheduled WC fixture found between these teams")
 
-    with console.status("Fetching match events for form analysis..."):
-        form_events: dict[int, list] = {}
-        for m in t1_form + t2_form:
-            if m.home_goals is not None:
-                form_events[m.fixture_id] = api.get_fixture_events(m.fixture_id)
+    finished = [m for m in t1_form + t2_form if m.home_goals is not None]
+    with console.status("Fetching fixture details and form events (parallel)..."):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            ev_jobs = {
+                m.fixture_id: pool.submit(_safe, lambda fid=m.fixture_id: api.get_fixture_events(fid), None)
+                for m in finished
+            }
+            fx_jobs = {}
+            if fixture:
+                fid = fixture.fixture_id
+                fx_jobs["injuries"] = pool.submit(_safe, lambda: api.get_injuries(fid), [])
+                fx_jobs["lineups"] = pool.submit(_safe, lambda: api.get_lineups(fid), [])
+                fx_jobs["api_prediction"] = pool.submit(_safe, lambda: api.get_predictions(fid), None)
+                fx_jobs["odds"] = pool.submit(_safe, lambda: api.get_odds(fid), [])
+                fx_jobs["wc_events"] = pool.submit(_safe, lambda: api.get_fixture_events(fid), [])
+                fx_jobs["fixture_players"] = pool.submit(_safe, lambda: api.get_fixture_players(fid), [])
+                if fixture.status == "FT":
+                    fx_jobs["fixture_stats"] = pool.submit(_safe, lambda: api.get_fixture_stats(fid), [])
+
+            form_events: dict[int, list] = {}
+            for mfid, job in ev_jobs.items():
+                events = job.result()
+                if events is not None:
+                    form_events[mfid] = events
+            fx = {name: job.result() for name, job in fx_jobs.items()}
+
     event_count = sum(len(v) for v in form_events.values())
     console.print(f"  [green]✓[/green] Form events: {event_count} events across {len(form_events)} matches")
 
-    with console.status("Fetching tournament top assists..."):
-        top_assists = api.get_topassists()
-    console.print(f"  [green]✓[/green] Top assists: {len(top_assists)} players" if top_assists else f"  [yellow]·[/yellow] Top assists: not yet available")
-
-    with console.status("Fetching disciplinary leaders..."):
-        top_yellowcards = api.get_top_yellowcards()
-    console.print(f"  [green]✓[/green] Yellow card leaders: {len(top_yellowcards)} players" if top_yellowcards else f"  [yellow]·[/yellow] Yellow card leaders: not yet available")
-
-    odds = []
-    wc_events = []
-    fixture_players = []
+    injuries, lineups, api_prediction = [], [], None
+    odds, wc_events, fixture_players, fixture_stats = [], [], [], []
     if fixture:
-        with console.status("Fetching pre-match odds..."):
-            odds = api.get_odds(fixture.fixture_id)
+        injuries = fx["injuries"]
+        lineups = fx["lineups"]
+        api_prediction = fx["api_prediction"]
+        odds = fx["odds"]
+        wc_events = fx["wc_events"]
+        fixture_players = fx["fixture_players"]
+        fixture_stats = fx.get("fixture_stats", [])
+
+        console.print(f"  [green]✓[/green] Injuries: {len(injuries)} player(s) reported")
+        console.print(f"  [green]✓[/green] Lineups: confirmed" if lineups else f"  [yellow]·[/yellow] Lineups: not yet announced")
+        console.print(f"  [green]✓[/green] API prediction: available" if api_prediction else f"  [yellow]·[/yellow] API prediction: not available")
         console.print(f"  [green]✓[/green] Odds: {len(odds)} bookmaker(s)" if odds else f"  [yellow]·[/yellow] Odds: not available")
-
-        with console.status("Fetching fixture events..."):
-            wc_events = api.get_fixture_events(fixture.fixture_id)
         console.print(f"  [green]✓[/green] Fixture events: {len(wc_events)} events" if wc_events else f"  [yellow]·[/yellow] Fixture events: none yet")
-
-        with console.status("Fetching fixture player stats..."):
-            fixture_players = api.get_fixture_players(fixture.fixture_id)
         console.print(f"  [green]✓[/green] Fixture player stats: {len(fixture_players)} players" if fixture_players else f"  [yellow]·[/yellow] Fixture player stats: not available")
+        if fixture.status == "FT":
+            console.print(f"  [green]✓[/green] Match statistics: available" if fixture_stats else f"  [yellow]·[/yellow] Match statistics: not available")
 
     console.print()
 
@@ -311,8 +307,134 @@ def analyze(
     )
     console.print(f"\n[green]✓[/green] Report saved: [bold]{report_path}[/bold]")
 
+    from ledger import record_prediction
+    record_prediction(t1, t2, fixture, ai_analysis, model, report_path)
+    console.print(f"[dim]Prediction recorded — run `record` to track results.[/dim]")
+    return report_path
+
 
 @app.command()
+@_handle_api_errors
+def analyze(
+    team1: str = typer.Argument(..., help="First team name"),
+    team2: str = typer.Argument(..., help="Second team name"),
+    form: int = typer.Option(5, "-f", "--form", help="Number of recent matches to fetch per team"),
+    h2h_count: int = typer.Option(10, "--h2h", help="Number of H2H matches to fetch"),
+):
+    """Analyze a matchup and predict the outcome using AI."""
+    api, openrouter_key, model = _get_api()
+
+    console.print(Panel.fit("[bold cyan]World Cup 2026 — Match Analyzer[/bold cyan]"))
+    console.print()
+
+    t1 = _resolve_team(api, team1)
+    if not t1:
+        raise typer.Exit(1)
+    t2 = _resolve_team(api, team2)
+    if not t2:
+        raise typer.Exit(1)
+
+    console.print()
+    _run_analysis(api, openrouter_key, model, t1, t2, form, h2h_count)
+
+
+@app.command(name="analyze-day")
+@_handle_api_errors
+def analyze_day(
+    date: Optional[str] = typer.Argument(None, help="Date (YYYY-MM-DD), defaults to today (UTC)"),
+    form: int = typer.Option(5, "-f", "--form", help="Number of recent matches to fetch per team"),
+    h2h_count: int = typer.Option(10, "--h2h", help="Number of H2H matches to fetch"),
+):
+    """Analyze every World Cup fixture on a given date."""
+    api, openrouter_key, model = _get_api()
+    target = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with console.status("Fetching World Cup fixtures..."):
+        day_fixtures = [f for f in api.get_wc_fixtures() if f.date[:10] == target]
+
+    if not day_fixtures:
+        console.print(f"[yellow]No fixtures on {target}.[/yellow]")
+        return
+
+    day_fixtures.sort(key=lambda f: f.date)
+    console.print(Panel.fit(f"[bold cyan]World Cup 2026 — {len(day_fixtures)} fixture(s) on {target}[/bold cyan]"))
+
+    for i, f in enumerate(day_fixtures, 1):
+        console.print()
+        console.print(Panel.fit(f"[bold]{i}/{len(day_fixtures)} — {f.home_team.name} vs {f.away_team.name}[/bold] ({f.round})"))
+        _run_analysis(api, openrouter_key, model, f.home_team, f.away_team, form, h2h_count)
+
+
+@app.command()
+@_handle_api_errors
+def record():
+    """Show recorded predictions and how they fared."""
+    from ledger import grade_bet, load_predictions
+
+    preds = load_predictions()
+    if not preds:
+        console.print("[yellow]No predictions recorded yet — run `analyze` first.[/yellow]")
+        return
+
+    # Re-analyzing a match supersedes the earlier prediction
+    latest: dict = {}
+    unscheduled = []
+    for p in preds:
+        if p.get("fixture_id"):
+            latest[p["fixture_id"]] = p
+        else:
+            unscheduled.append(p)
+    preds = sorted(
+        list(latest.values()) + unscheduled,
+        key=lambda p: p.get("fixture_date") or p["recorded_at"],
+    )
+
+    api, _, _model = _get_api()
+    from api.football import FINISHED_STATUSES
+    with console.status("Fetching results..."):
+        fixtures_by_id = {f.fixture_id: f for f in api.get_wc_fixtures()}
+
+    table = Table(title="Prediction record", box=box.ROUNDED)
+    table.add_column("Date", style="cyan")
+    table.add_column("Match")
+    table.add_column("Best Bet")
+    table.add_column("Conf", justify="center")
+    table.add_column("Score", justify="center")
+    table.add_column("Result", justify="center")
+
+    wins = losses = 0
+    for p in preds:
+        f = fixtures_by_id.get(p["fixture_id"])
+        if f and f.status in FINISHED_STATUSES and f.home_goals is not None:
+            score = f"{f.home_goals}-{f.away_goals}"
+            graded = grade_bet(p["best_bet"], p["home"], p["away"], f.home_goals, f.away_goals)
+            if graded is True:
+                result = "[green]WIN[/green]"
+                wins += 1
+            elif graded is False:
+                result = "[red]LOSS[/red]"
+                losses += 1
+            else:
+                result = "[dim]ungraded[/dim]"
+        else:
+            score, result = "—", "[dim]pending[/dim]"
+        table.add_row(
+            (p.get("fixture_date") or p["recorded_at"])[:10],
+            f"{p['home']} vs {p['away']}",
+            p["best_bet"] or "—",
+            f"{p['confidence']}/10" if p.get("confidence") else "—",
+            score,
+            result,
+        )
+
+    console.print(table)
+    graded_total = wins + losses
+    if graded_total:
+        console.print(f"Record: [bold]{wins}W-{losses}L[/bold] ({wins / graded_total:.0%}) over {graded_total} auto-graded bets")
+
+
+@app.command()
+@_handle_api_errors
 def search(name: str = typer.Argument(..., help="Team name to search")):
     """Search for a team by name and show its ID."""
     api, _, _model = _get_api()

@@ -14,3 +14,8 @@ dependencies = [
 
 [project.scripts]
 wca = "main:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
