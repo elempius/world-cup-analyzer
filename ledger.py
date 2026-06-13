@@ -72,12 +72,20 @@ def price_bet(
 
 
 def record_prediction(
-    team1, team2, fixture, analysis: str, model: str, report_path,
+    team1, team2, fixture, analysis: str, model: str,
     odds_markets: Optional[dict] = None,
+    forecast=None,
 ) -> None:
     bet, confidence = extract_best_bet(analysis)
     home = fixture.home_team.name if fixture else team1.name
     away = fixture.away_team.name if fixture else team2.name
+
+    model_prob = None
+    if forecast is not None:
+        from model import prob_for_bet
+        p = prob_for_bet(forecast, bet, home, away)
+        model_prob = round(p, 4) if p is not None else None
+
     entry = {
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "fixture_id": fixture.fixture_id if fixture else None,
@@ -88,7 +96,7 @@ def record_prediction(
         "best_bet": bet,
         "confidence": confidence,
         "odds": price_bet(odds_markets or {}, bet, home, away),
-        "report": str(report_path),
+        "model_prob": model_prob,
     }
     LEDGER_PATH.parent.mkdir(exist_ok=True)
     with LEDGER_PATH.open("a") as f:
@@ -99,6 +107,24 @@ def load_predictions() -> list[dict]:
     if not LEDGER_PATH.exists():
         return []
     return [json.loads(line) for line in LEDGER_PATH.read_text().splitlines() if line.strip()]
+
+
+def kelly_fraction(prob: Optional[float], odds: Optional[float]) -> float:
+    """Full-Kelly optimal stake fraction for a bet at decimal `odds` we believe
+    wins with probability `prob`. Returns 0 when there's no edge or inputs are
+    missing. Callers typically scale this by a fractional-Kelly multiplier."""
+    if not prob or not odds or odds <= 1:
+        return 0.0
+    b = odds - 1
+    f = (prob * b - (1 - prob)) / b
+    return max(0.0, f)
+
+
+def brier_score(samples: list[tuple[Optional[float], bool]]) -> Optional[float]:
+    """Mean squared error of model probabilities against binary outcomes.
+    0 is perfect, 0.25 is a coin flip, 1 is confidently wrong. None if empty."""
+    vals = [(p - (1.0 if outcome else 0.0)) ** 2 for p, outcome in samples if p is not None]
+    return sum(vals) / len(vals) if vals else None
 
 
 def grade_bet(

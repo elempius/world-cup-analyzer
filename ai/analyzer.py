@@ -4,24 +4,40 @@ from openai import OpenAI
 from rich.console import Console
 from rich.rule import Rule
 
+import config
 from api.models import ApiPrediction, BookmakerOdds, FixtureEvent, FixturePlayerStat, FixtureTeamStat, Injury, Last5, MatchResult, PlayerStat, StandingsEntry, Team, TeamLineup, TeamStats, WCFixture
+from model import MatchForecast
 
 console = Console()
 
 SYSTEM_PROMPT = """\
-You are an expert football analyst specializing in international tournament match prediction.
-You have deep knowledge of team tactics, player form, set pieces, historical patterns, and \
-psychological factors in knockout and group stage football.
+You are a football analyst who reasons strictly from a supplied data dossier. You produce
+match predictions for the FIFA World Cup 2026.
 
-Rules:
+CRITICAL — data grounding:
+- Use ONLY the data provided in the user message. Do not rely on your own prior knowledge of
+  squads, transfers, recent results, rankings, or form. Your training data predates this
+  tournament and is unreliable for it; treating it as fact will produce wrong predictions.
+- Every factual claim you make must trace back to a specific line in the dossier. Do not invent
+  scorelines, player names, injuries, or statistics that are not present.
+- If something needed for a judgement is not in the dossier, say so explicitly
+  ("not available in the provided data") rather than filling the gap from memory or guessing.
+- The "Statistical Model (in-house)" section is your primary quantitative anchor — it is computed
+  from the form and goal data in this dossier and, when bookmaker odds are present, blended toward
+  the market. Build your prediction around it, but treat it as a rough estimate, not gospel.
+- Treat any "API-Football Prediction" section as a secondary input only; it is often sparse.
+- Treat the pre-match odds as the market's best probability estimate; it already accounts for squad
+  quality and strength of schedule that the raw form numbers do not. Do NOT reflexively back the
+  underdog or the higher-priced outcome — a longer price is not "value" by itself. Only favour an
+  outcome the market rates unlikely if the dossier gives a concrete, stated reason (injuries,
+  lineups, a clear stylistic mismatch). When the model and market broadly agree, backing the
+  favourite is a perfectly legitimate Best Bet.
+
+Style rules:
 - Do not use emoji anywhere in your response.
-- Be direct and specific — reference the actual scorelines and statistics provided.
-- Identify the single key tactical battle that will decide the match.
+- Be direct and specific — cite the actual scorelines, rates, and probabilities provided.
+- Identify the single key tactical battle that will decide the match (from the data given).
 - Acknowledge genuine uncertainty; do not manufacture false confidence.
-- When an API-Football prediction is provided, treat it as a data input alongside all other \
-evidence — synthesize it with your own analysis rather than deferring to it blindly. \
-Explicitly flag where your view agrees or diverges.
-- When pre-match odds are provided, treat them as a market-consensus calibration signal.
 - Keep each section concise — no padding or filler.
 
 Structure your response with exactly these sections:
@@ -35,7 +51,10 @@ Structure your response with exactly these sections:
 The Prediction section must end with a single "Best Bet" — one specific recommendation \
 (e.g. "Argentina -1 Asian handicap", "Under 2.5 goals", "Both teams to score: No") \
 that you have the highest conviction in given all available data, followed by your \
-confidence rating (X/10) and 2-3 sentences explaining why this is the value pick.
+confidence rating (X/10) and 2-3 sentences explaining your reasoning. Ground the pick in the \
+model probabilities and the dossier; note whether it agrees with the market. Do not force a \
+contrarian angle — if the data does not support disagreeing with the odds, pick the bet you are \
+most confident is correct, even if it is the favourite at a short price.
 """
 
 
@@ -176,9 +195,28 @@ def _fmt_last5(l5: Optional[Last5], name: str) -> str:
     )
 
 
+def _format_forecast(f: Optional[MatchForecast]) -> str:
+    if not f:
+        return ""
+    odds = f.fair_odds()
+    scores = ", ".join(f"{s} ({p:.0%})" for s, p in f.top_scorelines[:4])
+    lines = [
+        "Statistical Model (in-house, computed from the form and goal data above):",
+        f"  Method: bivariate-Poisson goals model. Data basis — {f.basis}.",
+        f"  Expected goals: {f.home_name} {f.exp_goals_home} / {f.away_name} {f.exp_goals_away}",
+        f"  Win probability: {f.home_name} {f.p_home:.0%} / Draw {f.p_draw:.0%} / {f.away_name} {f.p_away:.0%}",
+        f"  Fair 1X2 odds: {odds['home']} / {odds['draw']} / {odds['away']}",
+        f"  Over 2.5 goals: {f.over_probs.get(2.5, 0):.0%} (fair {odds['over_2.5']})  |  "
+        f"Under 2.5: {1 - f.over_probs.get(2.5, 0):.0%} (fair {odds['under_2.5']})",
+        f"  Both teams to score: {f.p_btts:.0%} (fair {odds['btts_yes']})",
+        f"  Most likely scorelines: {scores}",
+    ]
+    return "\n".join(lines)
+
+
 def _format_prediction(pred: Optional[ApiPrediction], home_name: str, away_name: str) -> str:
-    if not pred:
-        return "API Prediction: Not available for this fixture.\n"
+    if not pred or not pred.is_populated:
+        return ""
     lines = [
         "API-Football Prediction:",
         f"  Advice: {pred.advice}",
@@ -352,6 +390,7 @@ def build_prompt(
     top_yellowcards: Optional[list[PlayerStat]] = None,
     wc_events: Optional[list[FixtureEvent]] = None,
     fixture_players: Optional[list[FixturePlayerStat]] = None,
+    forecast: Optional[MatchForecast] = None,
 ) -> str:
     if fixture:
         context = (
@@ -454,37 +493,97 @@ def build_prompt(
     if odds_str:
         sections += ["## " + odds_str, ""]
 
-    if api_prediction:
-        sections += ["## " + _format_prediction(api_prediction, home_name, away_name)]
+    forecast_str = _format_forecast(forecast)
+    if forecast_str:
+        sections += ["## Statistical Model (in-house)", forecast_str, ""]
+
+    pred_str = _format_prediction(api_prediction, home_name, away_name)
+    if pred_str:
+        sections += ["## API-Football Prediction", pred_str, ""]
 
     return "\n".join(sections)
 
 
-def stream_analysis(openrouter_key: str, prompt: str, model: str) -> str:
-    client = OpenAI(
+def _client(openrouter_key: str) -> OpenAI:
+    return OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=openrouter_key,
         default_headers={"X-Title": "World Cup Analyzer"},
     )
-    console.print(Rule("[bold cyan]AI Analysis[/bold cyan]"))
-    console.print()
+
+
+def _stream_completion(client: OpenAI, messages: list[dict], model: str) -> str:
+    """Stream one completion, rendering the model's reasoning (dimmed) ahead of
+    its answer. Returns only the answer text (reasoning is not persisted)."""
+    extra_body = {}
+    if config.REASONING_EFFORT:
+        extra_body["reasoning"] = {"effort": config.REASONING_EFFORT}
 
     stream = client.chat.completions.create(
         model=model,
-        max_tokens=2048,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        max_tokens=config.MAX_TOKENS,
+        messages=messages,
         stream=True,
+        extra_body=extra_body,
     )
-    chunks = []
+
+    reasoning_open = False
+    answer_open = False
+    chunks: list[str] = []
     for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            console.print(delta, end="", markup=False, highlight=False)
-            chunks.append(delta)
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        reasoning = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+        if reasoning:
+            if not reasoning_open:
+                console.print("[dim italic]thinking…[/dim italic]")
+                reasoning_open = True
+            console.print(reasoning, end="", style="dim", markup=False, highlight=False)
+        content = getattr(delta, "content", None)
+        if content:
+            if not answer_open:
+                if reasoning_open:
+                    console.print()
+                    console.print(Rule("[bold cyan]Answer[/bold cyan]"))
+                answer_open = True
+            console.print(content, end="", markup=False, highlight=False)
+            chunks.append(content)
 
     console.print()
-    console.print(Rule())
     return "".join(chunks)
+
+
+def stream_analysis(openrouter_key: str, prompt: str, model: str) -> tuple[str, OpenAI, list[dict]]:
+    """Run the initial analysis. Returns (answer, client, messages) so the caller
+    can continue the same conversation in an interactive session."""
+    client = _client(openrouter_key)
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    console.print(Rule("[bold cyan]AI Analysis[/bold cyan]"))
+    console.print()
+    answer = _stream_completion(client, messages, model)
+    console.print(Rule())
+    messages.append({"role": "assistant", "content": answer})
+    return answer, client, messages
+
+
+def interactive_session(client: OpenAI, messages: list[dict], model: str) -> None:
+    """Drop into a follow-up Q&A loop over the same conversation. Ends on a blank
+    line, 'exit'/'quit', or EOF/Ctrl-C."""
+    console.print()
+    console.print("[dim]Ask follow-up questions about this match. Press Enter on an empty line (or type 'exit') to finish.[/dim]")
+    while True:
+        try:
+            question = console.input("\n[bold cyan]you ▸[/bold cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            break
+        if not question or question.lower() in {"exit", "quit", "q"}:
+            break
+        messages.append({"role": "user", "content": question})
+        console.print()
+        answer = _stream_completion(client, messages, model)
+        messages.append({"role": "assistant", "content": answer})

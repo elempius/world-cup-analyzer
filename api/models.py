@@ -201,6 +201,20 @@ class ApiPrediction:
     home_under_over: Optional[UnderOver]
     away_under_over: Optional[UnderOver]
 
+    @property
+    def is_populated(self) -> bool:
+        """True when the API actually returned a usable prediction.
+
+        For most World Cup 2026 fixtures the /predictions endpoint responds with
+        blank placeholders ("?" percentages, no advice/winner). Treat those as
+        absent rather than surfacing empty rows to the model.
+        """
+        has_percent = any(
+            p not in ("?", "", "0%", None)
+            for p in (self.home_percent, self.draw_percent, self.away_percent)
+        )
+        return bool(self.advice or self.winner_name or has_percent)
+
 
 @dataclass
 class FixtureEvent:
