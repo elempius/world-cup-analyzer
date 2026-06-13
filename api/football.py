@@ -5,6 +5,7 @@ from typing import Optional
 
 import httpx
 
+import config
 from api.models import (
     ApiPrediction,
     BookmakerOdds,
@@ -62,7 +63,7 @@ class FootballAPI:
         self.client = httpx.Client(
             base_url="https://v3.football.api-sports.io",
             headers={"x-apisports-key": api_key},
-            timeout=30.0,
+            timeout=config.HTTP_TIMEOUT,
         )
         CACHE_DIR.mkdir(exist_ok=True)
 
@@ -90,7 +91,7 @@ class FootballAPI:
         self._set_cache(key, data)
         return data
 
-    def _fetch(self, endpoint: str, params: dict, attempts: int = 3):
+    def _fetch(self, endpoint: str, params: dict, attempts: int = config.FETCH_ATTEMPTS):
         last_error: Exception | None = None
         for attempt in range(attempts):
             if attempt:
@@ -113,12 +114,36 @@ class FootballAPI:
                 if "ratelimit" in msg.lower() or "too many requests" in msg.lower():
                     # Per-minute quota; wait it out and retry
                     last_error = FootballAPIError(f"{endpoint}: {msg}")
-                    time.sleep(8)
+                    time.sleep(config.RATE_LIMIT_SLEEP)
                     continue
                 raise FootballAPIError(f"{endpoint}: {msg}")
             return body.get("response", [])
         raise FootballAPIError(
             f"{endpoint}: request failed after {attempts} attempts ({last_error})"
+        )
+
+    @staticmethod
+    def _parse_player_row(r: dict) -> PlayerStat:
+        """Build a PlayerStat from a /players-shaped row (player + statistics)."""
+        p = r.get("player", {})
+        stats = (r.get("statistics") or [{}])[0]
+        games = stats.get("games", {})
+        goals = stats.get("goals", {})
+        shots = stats.get("shots", {})
+        passes = stats.get("passes", {})
+        cards = stats.get("cards", {})
+        return PlayerStat(
+            player_id=p.get("id", 0),
+            name=p.get("name", ""),
+            appearances=games.get("appearences") or 0,
+            minutes=games.get("minutes") or 0,
+            goals=goals.get("total") or 0,
+            assists=goals.get("assists") or 0,
+            shots_on=shots.get("on") or 0,
+            key_passes=passes.get("key") or 0,
+            rating=games.get("rating"),
+            yellow_cards=cards.get("yellow") or 0,
+            red_cards=cards.get("red") or 0,
         )
 
     # --- Public methods ---
@@ -356,28 +381,7 @@ class FootballAPI:
             {"league": self.league_id, "season": self.season, "team": team_id},
             "players",
         )
-        players = []
-        for r in results:
-            p = r.get("player", {})
-            stats = (r.get("statistics") or [{}])[0]
-            games = stats.get("games", {})
-            goals = stats.get("goals", {})
-            shots = stats.get("shots", {})
-            passes = stats.get("passes", {})
-            cards = stats.get("cards", {})
-            players.append(PlayerStat(
-                player_id=p.get("id", 0),
-                name=p.get("name", ""),
-                appearances=games.get("appearences") or 0,
-                minutes=games.get("minutes") or 0,
-                goals=goals.get("total") or 0,
-                assists=goals.get("assists") or 0,
-                shots_on=shots.get("on") or 0,
-                key_passes=passes.get("key") or 0,
-                rating=games.get("rating"),
-                yellow_cards=cards.get("yellow") or 0,
-                red_cards=cards.get("red") or 0,
-            ))
+        players = [self._parse_player_row(r) for r in results]
         return sorted(players, key=lambda p: (p.goals + p.assists, p.appearances), reverse=True)
 
     def get_top_scorers(self, limit: int = 10) -> list[PlayerStat]:
@@ -386,29 +390,7 @@ class FootballAPI:
             {"league": self.league_id, "season": self.season},
             "topscorers",
         )
-        players = []
-        for r in results[:limit]:
-            p = r.get("player", {})
-            stats = (r.get("statistics") or [{}])[0]
-            games = stats.get("games", {})
-            goals = stats.get("goals", {})
-            shots = stats.get("shots", {})
-            passes = stats.get("passes", {})
-            cards = stats.get("cards", {})
-            players.append(PlayerStat(
-                player_id=p.get("id", 0),
-                name=p.get("name", ""),
-                appearances=games.get("appearences") or 0,
-                minutes=games.get("minutes") or 0,
-                goals=goals.get("total") or 0,
-                assists=goals.get("assists") or 0,
-                shots_on=shots.get("on") or 0,
-                key_passes=passes.get("key") or 0,
-                rating=games.get("rating"),
-                yellow_cards=cards.get("yellow") or 0,
-                red_cards=cards.get("red") or 0,
-            ))
-        return players
+        return [self._parse_player_row(r) for r in results[:limit]]
 
     def get_fixture_stats(self, fixture_id: int) -> list[FixtureTeamStat]:
         results = self._get("/fixtures/statistics", {"fixture": fixture_id}, "fixture_stats")
@@ -496,7 +478,7 @@ class FootballAPI:
                             draw=vals.get("Draw", "?"),
                             away=vals.get("Away", "?"),
                         ))
-        return bookmakers[:5]
+        return bookmakers[:config.ODDS_BOOKMAKER_LIMIT]
 
     def get_odds_markets(self, fixture_id: int) -> dict[str, dict[str, float]]:
         """Best available odd per market and outcome across all bookmakers,
@@ -523,29 +505,7 @@ class FootballAPI:
             {"league": self.league_id, "season": self.season},
             "topassists",
         )
-        players = []
-        for r in results[:limit]:
-            p = r.get("player", {})
-            stats = (r.get("statistics") or [{}])[0]
-            games = stats.get("games", {})
-            goals = stats.get("goals", {})
-            shots = stats.get("shots", {})
-            passes = stats.get("passes", {})
-            cards = stats.get("cards", {})
-            players.append(PlayerStat(
-                player_id=p.get("id", 0),
-                name=p.get("name", ""),
-                appearances=games.get("appearences") or 0,
-                minutes=games.get("minutes") or 0,
-                goals=goals.get("total") or 0,
-                assists=goals.get("assists") or 0,
-                shots_on=shots.get("on") or 0,
-                key_passes=passes.get("key") or 0,
-                rating=games.get("rating"),
-                yellow_cards=cards.get("yellow") or 0,
-                red_cards=cards.get("red") or 0,
-            ))
-        return players
+        return [self._parse_player_row(r) for r in results[:limit]]
 
     def get_top_yellowcards(self, limit: int = 10) -> list[PlayerStat]:
         results = self._get(
@@ -553,29 +513,7 @@ class FootballAPI:
             {"league": self.league_id, "season": self.season},
             "topyellowcards",
         )
-        players = []
-        for r in results[:limit]:
-            p = r.get("player", {})
-            stats = (r.get("statistics") or [{}])[0]
-            games = stats.get("games", {})
-            goals = stats.get("goals", {})
-            shots = stats.get("shots", {})
-            passes = stats.get("passes", {})
-            cards = stats.get("cards", {})
-            players.append(PlayerStat(
-                player_id=p.get("id", 0),
-                name=p.get("name", ""),
-                appearances=games.get("appearences") or 0,
-                minutes=games.get("minutes") or 0,
-                goals=goals.get("total") or 0,
-                assists=goals.get("assists") or 0,
-                shots_on=shots.get("on") or 0,
-                key_passes=passes.get("key") or 0,
-                rating=games.get("rating"),
-                yellow_cards=cards.get("yellow") or 0,
-                red_cards=cards.get("red") or 0,
-            ))
-        return players
+        return [self._parse_player_row(r) for r in results[:limit]]
 
     def get_predictions(self, fixture_id: int) -> Optional[ApiPrediction]:
         results = self._get("/predictions", {"fixture": fixture_id}, "predictions")

@@ -12,6 +12,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from api.models import Team
+
 load_dotenv()
 
 app = typer.Typer(
@@ -66,7 +68,7 @@ def _safe(fetch, default):
         return default
 
 
-def _resolve_team(api, name_or_id: str) -> Optional[object]:
+def _resolve_team(api, name_or_id: str) -> Optional[Team]:
     # Numeric input → treat as team ID directly
     if name_or_id.isdigit():
         team_id = int(name_or_id)
@@ -174,9 +176,19 @@ def fixtures(
     console.print(f"[dim]Showing {len(filtered)} fixture(s). Use --all to include all matches.[/dim]")
 
 
-def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_count: int):
-    """Fetch all data for a matchup, stream the AI analysis, and save the report."""
-    from ai.analyzer import build_prompt, stream_analysis
+def _run_analysis(
+    api,
+    openrouter_key: str,
+    model: str,
+    t1: Team,
+    t2: Team,
+    form: int,
+    h2h_count: int,
+    chat: bool = False,
+):
+    """Fetch all data for a matchup, compute the forecast, and stream the AI analysis."""
+    from ai.analyzer import build_prompt, interactive_session, stream_analysis
+    from model import forecast_match
 
     with console.status("Fetching team and tournament data (parallel)..."):
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -271,6 +283,26 @@ def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_c
         if fixture.status == "FT":
             console.print(f"  [green]✓[/green] Match statistics: available" if fixture_stats else f"  [yellow]·[/yellow] Match statistics: not available")
 
+    # Orient home/away for the statistical model (the schedule decides who is home).
+    if fixture and t2.id == fixture.home_team.id:
+        home_team, away_team = t2, t1
+        home_form, away_form = t2_form, t1_form
+        home_stats, away_stats = t2_stats, t1_stats
+    else:
+        home_team, away_team = t1, t2
+        home_form, away_form = t1_form, t2_form
+        home_stats, away_stats = t1_stats, t2_stats
+
+    forecast = forecast_match(
+        home_team, away_team, home_form, away_form, home_stats, away_stats, h2h,
+        odds=odds,
+    )
+    console.print(
+        f"  [green]✓[/green] In-house model: "
+        f"{forecast.home_name} {forecast.p_home:.0%} / Draw {forecast.p_draw:.0%} / "
+        f"{forecast.away_name} {forecast.p_away:.0%}  "
+        f"(xG {forecast.exp_goals_home}-{forecast.exp_goals_away})"
+    )
     console.print()
 
     prompt = build_prompt(
@@ -289,30 +321,23 @@ def _run_analysis(api, openrouter_key: str, model: str, t1, t2, form: int, h2h_c
         top_yellowcards=top_yellowcards or None,
         wc_events=wc_events or None,
         fixture_players=fixture_players or None,
+        forecast=forecast,
     )
 
     console.print(f"[dim]Sending data to {model} for analysis...[/dim]")
     console.print()
-    ai_analysis = stream_analysis(openrouter_key, prompt, model=model)
-
-    from export import save_report
-    report_path = save_report(
-        t1, t2, t1_form, t2_form, h2h, injuries, lineups, fixture,
-        t1_stats, t2_stats, standings or None, api_prediction, ai_analysis, model,
-        t1_players or None, t2_players or None, top_scorers or None, fixture_stats or None,
-        form_events=form_events or None,
-        odds=odds or None,
-        top_assists=top_assists or None,
-        top_yellowcards=top_yellowcards or None,
-        wc_events=wc_events or None,
-        fixture_players=fixture_players or None,
-    )
-    console.print(f"\n[green]✓[/green] Report saved: [bold]{report_path}[/bold]")
+    ai_analysis, client, messages = stream_analysis(openrouter_key, prompt, model=model)
 
     from ledger import record_prediction
-    record_prediction(t1, t2, fixture, ai_analysis, model, report_path, odds_markets=odds_markets)
-    console.print(f"[dim]Prediction recorded — run `record` to track results.[/dim]")
-    return report_path
+    record_prediction(
+        t1, t2, fixture, ai_analysis, model,
+        odds_markets=odds_markets, forecast=forecast,
+    )
+    console.print(f"\n[dim]Prediction recorded — run `record` to track results.[/dim]")
+
+    if chat and sys.stdin.isatty():
+        interactive_session(client, messages, model=model)
+    return ai_analysis
 
 
 @app.command()
@@ -322,6 +347,7 @@ def analyze(
     team2: str = typer.Argument(..., help="Second team name"),
     form: int = typer.Option(5, "-f", "--form", help="Number of recent matches to fetch per team"),
     h2h_count: int = typer.Option(10, "--h2h", help="Number of H2H matches to fetch"),
+    chat: bool = typer.Option(True, "--chat/--no-chat", help="Open an interactive Q&A session after the analysis"),
 ):
     """Analyze a matchup and predict the outcome using AI."""
     api, openrouter_key, model = _get_api()
@@ -337,7 +363,7 @@ def analyze(
         raise typer.Exit(1)
 
     console.print()
-    _run_analysis(api, openrouter_key, model, t1, t2, form, h2h_count)
+    _run_analysis(api, openrouter_key, model, t1, t2, form, h2h_count, chat=chat)
 
 
 @app.command(name="analyze-day")
@@ -346,6 +372,7 @@ def analyze_day(
     date: Optional[str] = typer.Argument(None, help="Date (YYYY-MM-DD), defaults to today (UTC)"),
     form: int = typer.Option(5, "-f", "--form", help="Number of recent matches to fetch per team"),
     h2h_count: int = typer.Option(10, "--h2h", help="Number of H2H matches to fetch"),
+    chat: bool = typer.Option(False, "--chat/--no-chat", help="Open an interactive Q&A session after each analysis"),
 ):
     """Analyze every World Cup fixture on a given date."""
     api, openrouter_key, model = _get_api()
@@ -364,14 +391,15 @@ def analyze_day(
     for i, f in enumerate(day_fixtures, 1):
         console.print()
         console.print(Panel.fit(f"[bold]{i}/{len(day_fixtures)} — {f.home_team.name} vs {f.away_team.name}[/bold] ({f.round})"))
-        _run_analysis(api, openrouter_key, model, f.home_team, f.away_team, form, h2h_count)
+        _run_analysis(api, openrouter_key, model, f.home_team, f.away_team, form, h2h_count, chat=chat)
 
 
 @app.command()
 @_handle_api_errors
 def record():
     """Show recorded predictions and how they fared."""
-    from ledger import grade_bet, load_predictions
+    import config
+    from ledger import brier_score, grade_bet, kelly_fraction, load_predictions
 
     preds = load_predictions()
     if not preds:
@@ -408,10 +436,14 @@ def record():
     wins = losses = 0
     profit = 0.0
     priced = 0
+    kelly_profit = 0.0
+    kelly_staked = 0.0
+    brier_samples: list[tuple[Optional[float], bool]] = []
     by_conf: dict[str, list[int]] = {}
     for p in preds:
         f = fixtures_by_id.get(p["fixture_id"])
         odds = p.get("odds")
+        model_prob = p.get("model_prob")
         if f and f.status in FINISHED_STATUSES and f.home_goals is not None:
             score = f"{f.home_goals}-{f.away_goals}"
             graded = grade_bet(p["best_bet"], p["home"], p["away"], f.home_goals, f.away_goals)
@@ -427,6 +459,11 @@ def record():
                 if odds:
                     profit += (odds - 1) if graded else -1
                     priced += 1
+                    stake = config.KELLY_FRACTION * kelly_fraction(model_prob, odds)
+                    if stake > 0:
+                        kelly_profit += stake * (odds - 1) if graded else -stake
+                        kelly_staked += stake
+                brier_samples.append((model_prob, graded))
                 conf = p.get("confidence") or "?"
                 by_conf.setdefault(conf, [0, 0])[0 if graded else 1] += 1
         else:
@@ -450,6 +487,20 @@ def record():
             console.print(
                 f"Flat 1u stakes at best available odds: [{color}]{profit:+.2f}u[/{color}] "
                 f"over {priced} priced bets (ROI {profit / priced:+.1%})"
+            )
+        if kelly_staked > 0:
+            kcolor = "green" if kelly_profit >= 0 else "red"
+            console.print(
+                f"{config.KELLY_FRACTION:g}-Kelly staking (model edge vs odds): "
+                f"[{kcolor}]{kelly_profit:+.2f}u[/{kcolor}] on {kelly_staked:.2f}u staked "
+                f"(ROI {kelly_profit / kelly_staked:+.1%})"
+            )
+        brier = brier_score(brier_samples)
+        if brier is not None:
+            n_cal = len([s for s in brier_samples if s[0] is not None])
+            console.print(
+                f"Model calibration (Brier score): [bold]{brier:.3f}[/bold] over {n_cal} graded bets "
+                f"[dim](0=perfect, 0.25=coin flip, lower is better)[/dim]"
             )
         if len(by_conf) > 1:
             parts = [

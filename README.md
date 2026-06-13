@@ -2,7 +2,7 @@
 
 AI-powered match analysis and prediction for the FIFA World Cup 2026.
 
-Pulls live data from API-Football across multiple endpoints and streams a structured analysis via any model on OpenRouter, saving a self-contained HTML report per match.
+Pulls live data from API-Football across multiple endpoints, computes an in-house statistical forecast, and streams a structured, data-grounded analysis via any reasoning model on OpenRouter — then lets you interrogate the result in an interactive Q&A session.
 
 ---
 
@@ -41,6 +41,19 @@ uv sync
 | `WC_LEAGUE_ID` | League ID (default: `1` — FIFA World Cup) |
 | `WC_SEASON` | Season year (default: `2026`) |
 
+Optional tuning (all have sensible defaults — see `config.py`):
+
+| Variable | Description |
+|---|---|
+| `WCA_REASONING_EFFORT` | Thinking effort for reasoning models: `low` / `medium` / `high` (default `high`) |
+| `WCA_MAX_TOKENS` | Response token budget (default `8000`) |
+| `WCA_FORM_WEIGHT` | Weight of recent form vs. season averages in the model (default `0.5`) |
+| `WCA_HOME_ADVANTAGE` | Home expected-goals multiplier (default `1.10`) |
+| `WCA_MARKET_WEIGHT` | How strongly to anchor the model to de-vigged bookmaker odds, 0–1 (default `0.65`) |
+| `WCA_MAX_MATCH_GOALS` | Cap on one match's goal contribution, to curb minnow stat-padding (default `4`) |
+| `WCA_SHRINK_GAMES` | Phantom average-games added for small-sample shrinkage (default `4`) |
+| `WCA_KELLY_FRACTION` | Fractional-Kelly multiplier used in `record` (default `0.25`) |
+
 ---
 
 ## Usage
@@ -76,15 +89,27 @@ uv run python main.py fixtures --all             # all fixtures including finish
 
 uv run python main.py analyze "Brazil" "France" --form 8   # last 8 matches per team
 uv run python main.py analyze "Brazil" "France" --h2h 15   # last 15 H2H matches
+uv run python main.py analyze "Brazil" "France" --no-chat  # skip the interactive Q&A
 ```
 
-Each `analyze` run saves a self-contained HTML report to `results/`. Data is fetched concurrently (4 workers) with automatic retry on transient failures and rate limits; sections whose endpoints fail are skipped rather than aborting the run.
+Data is fetched concurrently with automatic retry on transient failures and rate limits; sections whose endpoints fail are skipped rather than aborting the run.
+
+### Interactive Q&A
+
+After the analysis streams, `analyze` drops into an interactive session where you can keep reasoning with the model and ask follow-up questions ("how would a back three change this?", "which under bet has the most edge?"). The full data dossier and the analysis stay in context. Press Enter on an empty line or type `exit` to finish. Use `--no-chat` to disable it; `analyze-day` runs without chat by default (`--chat` to enable per match).
 
 ---
 
 ## Prediction tracking
 
-Every analysis appends its **Best Bet**, confidence, and the best available bookmaker odds for that bet to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet), with a running win/loss record, profit/loss in units for flat 1-unit stakes with ROI, and a per-confidence breakdown — so you can see whether the high-conviction picks actually earn their rating. Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
+Every analysis appends its **Best Bet**, confidence, the best available bookmaker odds for that bet, and the in-house model's probability for it to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet). It reports:
+
+- a running **win/loss record** and per-confidence breakdown;
+- **flat 1-unit ROI** at best available odds;
+- **fractional-Kelly ROI**, sizing each stake by the model's edge over the odds (`f = edge / (odds − 1)`, scaled by `WCA_KELLY_FRACTION`) — rewarding bets where the model genuinely disagreed with the market;
+- a **Brier score** measuring how well-calibrated the model's probabilities were (0 = perfect, 0.25 = coin flip).
+
+Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
 
 ---
 
@@ -107,22 +132,40 @@ Each analysis pulls from the following API-Football endpoints:
 | Match events | Chronological goal/card timeline for the fixture |
 | Fixture player ratings | Per-player ratings and stats from the specific match |
 | Pre-match odds | 1X2 odds from up to 5 bookmakers |
-| API prediction | Win/draw/loss probabilities and comparison metrics |
+| API prediction | Win/draw/loss probabilities (often empty for these fixtures — used only when populated) |
 
 Sections are skipped entirely when data is unavailable — no placeholder output is generated.
 
 ---
 
+## In-house statistical model
+
+Because API-Football's own `/predictions` endpoint returns mostly empty placeholders for World Cup 2026 fixtures, the tool computes its own forecast (`model.py`) from data it *can* fetch reliably — recent form, tournament goal averages, and the head-to-head record. It is a transparent bivariate-Poisson goals model:
+
+1. Estimate each team's attacking and defensive goal rates from recent form (capped per match) and season averages, then **shrink** toward the league mean — so a small, noisy sample of thrashings against weak opposition can't run away with the estimate.
+2. Convert those into expected goals for this matchup, adjusting for home advantage and nudging toward the head-to-head goal pattern.
+3. **Anchor to the market:** when bookmaker odds are present, de-vig them into fair probabilities and blend the model toward them, then refit the goal rates to the blended probabilities. The market already prices in squad quality and strength of schedule that a raw goals-per-game number is blind to — without this, a minnow that beat even weaker teams looks like a world-beater.
+4. Build the Poisson score grid and read every market off it: 1X2 probabilities, expected goals, over/under, both-teams-to-score, most likely scorelines, and fair odds.
+
+This forecast is fed to the AI as its primary quantitative anchor and stored with each prediction for calibration scoring. Tune the market pull with `WCA_MARKET_WEIGHT` (set it to `0` for a pure, schedule-blind goals model).
+
+---
+
 ## AI analysis
 
-The AI receives all available data and produces a structured report covering:
+The model receives the full data dossier and produces a structured report covering:
 
 - **Form & Momentum**
 - **Head-to-Head**
 - **Key Tactical Battle**
 - **Players to Watch**
 - **Injury Impact**
-- **Prediction** — synthesizes the API-Football prediction with its own analysis, ending with a single high-conviction **Best Bet** recommendation and confidence rating
+- **Prediction** — built around the in-house statistical forecast, ending with a single high-conviction **Best Bet** recommendation, a confidence rating, and a value argument against the bookmaker odds
+
+Two things make the analysis trustworthy for a tournament that postdates the model's training data:
+
+- **Reasoning** — reasoning/thinking models are run with configurable effort; their deliberation streams (dimmed) ahead of the answer.
+- **Data grounding** — the system prompt forbids relying on the model's own memory of squads, form, or results. Every claim must trace to a line in the dossier, and the model is instructed to say "not available in the provided data" rather than guess.
 
 ---
 

@@ -2,7 +2,15 @@ import pytest
 
 import ledger
 from api.models import Team, WCFixture
-from ledger import extract_best_bet, grade_bet, load_predictions, price_bet, record_prediction
+from ledger import (
+    brier_score,
+    extract_best_bet,
+    grade_bet,
+    kelly_fraction,
+    load_predictions,
+    price_bet,
+    record_prediction,
+)
 
 MARKETS = {
     "Match Winner": {"Home": 1.65, "Draw": 3.80, "Away": 5.50},
@@ -97,7 +105,7 @@ def test_record_and_load_roundtrip(tmp_path, monkeypatch):
     analysis = "## Prediction\n**Best Bet:** Mexico -1 Asian handicap\nConfidence: 6/10."
     record_prediction(
         Team(id=16, name="Mexico"), Team(id=1531, name="South Africa"),
-        fixture, analysis, "test-model", "results/report.html",
+        fixture, analysis, "test-model",
         odds_markets=MARKETS,
     )
 
@@ -109,8 +117,61 @@ def test_record_and_load_roundtrip(tmp_path, monkeypatch):
     assert entry["confidence"] == "6"
     assert entry["home"] == "Mexico"
     assert entry["odds"] == 2.45
+    assert entry["model_prob"] is None  # no forecast supplied
+    assert "report" not in entry
 
 
 def test_load_predictions_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "LEDGER_PATH", tmp_path / "nope.jsonl")
     assert load_predictions() == []
+
+
+@pytest.mark.parametrize(
+    "prob,odds,expected",
+    [
+        (0.60, 2.0, 0.20),     # edge present: f* = (0.6*1 - 0.4)/1 = 0.2
+        (0.50, 2.0, 0.0),      # fair odds, no edge
+        (0.40, 2.0, 0.0),      # negative edge clamps to 0
+        (None, 2.0, 0.0),      # missing model prob
+        (0.60, None, 0.0),     # missing odds
+        (0.60, 1.0, 0.0),      # degenerate odds
+    ],
+)
+def test_kelly_fraction(prob, odds, expected):
+    assert kelly_fraction(prob, odds) == pytest.approx(expected)
+
+
+def test_brier_score():
+    # Confident and correct both times -> near 0.
+    assert brier_score([(0.9, True), (0.1, False)]) == pytest.approx((0.01 + 0.01) / 2)
+    # Confident and wrong -> near 1.
+    assert brier_score([(0.0, True)]) == pytest.approx(1.0)
+    # None probs are skipped; all-None -> None.
+    assert brier_score([(None, True), (None, False)]) is None
+    assert brier_score([]) is None
+
+
+def test_record_prediction_with_forecast(tmp_path, monkeypatch):
+    from model import forecast_match
+    from api.models import MatchResult
+
+    monkeypatch.setattr(ledger, "LEDGER_PATH", tmp_path / "results" / "predictions.jsonl")
+    home = Team(id=16, name="Mexico")
+    away = Team(id=1531, name="South Africa")
+
+    def played(h, a, hg, ag):
+        return MatchResult(
+            fixture_id=1, date="2026-01-01T00:00:00+00:00", league="Friendlies", round="",
+            home_team=h, away_team=a, home_goals=hg, away_goals=ag, status="FT",
+        )
+
+    home_form = [played(home, away, 3, 0), played(home, away, 2, 1)]
+    away_form = [played(away, home, 0, 2), played(away, home, 1, 1)]
+    forecast = forecast_match(home, away, home_form, away_form, None, None, [])
+
+    analysis = "## Prediction\n**Best Bet:** Mexico to win\nConfidence: 7/10."
+    record_prediction(home, away, None, analysis, "test-model", forecast=forecast)
+
+    entry = load_predictions()[0]
+    assert entry["model_prob"] is not None
+    assert 0.0 < entry["model_prob"] <= 1.0
