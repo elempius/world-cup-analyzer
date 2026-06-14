@@ -303,6 +303,22 @@ def _run_analysis(
         f"{forecast.away_name} {forecast.p_away:.0%}  "
         f"(xG {forecast.exp_goals_home}-{forecast.exp_goals_away})"
     )
+
+    from ledger import best_value_bet, suggest_stake, value_board
+    board = value_board(forecast, odds_markets, forecast.home_name, forecast.away_name)
+    pick = best_value_bet(board)
+    if pick:
+        stake = suggest_stake(pick["model_prob"], pick["odds"])
+        console.print(
+            f"  [green]✓[/green] Value bet: [bold]{pick['bet']}[/bold] @ {pick['odds']:.2f} "
+            f"(edge {pick['edge']:+.1%}) — suggested stake [bold]€{stake:.2f}[/bold] "
+            f"[dim](¼-Kelly, €{config.BANKROLL_EUR:.0f} bankroll)[/dim]"
+        )
+    else:
+        console.print(
+            f"  [yellow]○[/yellow] No bet clears the +{config.MIN_EDGE:.0%} edge threshold — "
+            f"market looks efficient (no value bet)"
+        )
     console.print()
 
     prompt = build_prompt(
@@ -322,6 +338,7 @@ def _run_analysis(
         wc_events=wc_events or None,
         fixture_players=fixture_players or None,
         forecast=forecast,
+        value_board=board,
     )
 
     console.print(f"[dim]Sending data to {model} for analysis...[/dim]")
@@ -430,6 +447,8 @@ def record():
     table.add_column("Best Bet")
     table.add_column("Conf", justify="center")
     table.add_column("Odds", justify="right")
+    table.add_column("Edge", justify="right")
+    table.add_column("Stake", justify="right")
     table.add_column("Score", justify="center")
     table.add_column("Result", justify="center")
 
@@ -438,12 +457,16 @@ def record():
     priced = 0
     kelly_profit = 0.0
     kelly_staked = 0.0
+    eur_profit = 0.0
+    eur_staked = 0.0
     brier_samples: list[tuple[Optional[float], bool]] = []
     by_conf: dict[str, list[int]] = {}
     for p in preds:
         f = fixtures_by_id.get(p["fixture_id"])
         odds = p.get("odds")
         model_prob = p.get("model_prob")
+        edge = p.get("edge")
+        stake_eur = p.get("stake_eur") or 0.0
         if f and f.status in FINISHED_STATUSES and f.home_goals is not None:
             score = f"{f.home_goals}-{f.away_goals}"
             graded = grade_bet(p["best_bet"], p["home"], p["away"], f.home_goals, f.away_goals)
@@ -463,6 +486,9 @@ def record():
                     if stake > 0:
                         kelly_profit += stake * (odds - 1) if graded else -stake
                         kelly_staked += stake
+                    if stake_eur > 0:
+                        eur_profit += stake_eur * (odds - 1) if graded else -stake_eur
+                        eur_staked += stake_eur
                 brier_samples.append((model_prob, graded))
                 conf = p.get("confidence") or "?"
                 by_conf.setdefault(conf, [0, 0])[0 if graded else 1] += 1
@@ -474,6 +500,8 @@ def record():
             p["best_bet"] or "—",
             f"{p['confidence']}/10" if p.get("confidence") else "—",
             f"{odds:.2f}" if odds else "—",
+            f"{edge:+.1%}" if edge is not None else "—",
+            f"€{stake_eur:.2f}" if stake_eur else "—",
             score,
             result,
         )
@@ -494,6 +522,13 @@ def record():
                 f"{config.KELLY_FRACTION:g}-Kelly staking (model edge vs odds): "
                 f"[{kcolor}]{kelly_profit:+.2f}u[/{kcolor}] on {kelly_staked:.2f}u staked "
                 f"(ROI {kelly_profit / kelly_staked:+.1%})"
+            )
+        if eur_staked > 0:
+            ecolor = "green" if eur_profit >= 0 else "red"
+            console.print(
+                f"Suggested EUR stakes (¼-Kelly, €{config.BANKROLL_EUR:.0f} bankroll): "
+                f"[{ecolor}]€{eur_profit:+.2f}[/{ecolor}] on €{eur_staked:.2f} staked "
+                f"(ROI {eur_profit / eur_staked:+.1%})"
             )
         brier = brier_score(brier_samples)
         if brier is not None:

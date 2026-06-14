@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import config
+
 LEDGER_PATH = Path("results/predictions.jsonl")
 
 
@@ -27,7 +29,18 @@ def price_bet(
     away: str,
 ) -> Optional[float]:
     """Best available bookmaker odds for a Best Bet, for the markets grade_bet
-    understands. Returns None when the bet can't be matched to a market."""
+    understands. Returns None when the bet can't be matched to a market or the
+    only price found is degenerate (<= 1.0, i.e. no real payout)."""
+    price = _lookup_price(markets, bet, home, away)
+    return price if price and price > 1.0 else None
+
+
+def _lookup_price(
+    markets: dict[str, dict[str, float]],
+    bet: Optional[str],
+    home: str,
+    away: str,
+) -> Optional[float]:
     if not bet or not markets:
         return None
     b = bet.lower()
@@ -71,6 +84,61 @@ def price_bet(
     return None
 
 
+def _candidate_bets(forecast, home: str, away: str) -> list[str]:
+    """The standard markets we can both model and price, as bet strings that
+    prob_for_bet and price_bet both understand."""
+    bets = [
+        f"{home} to win",
+        "Draw",
+        f"{away} to win",
+        f"{home} or draw (double chance)",
+        f"{away} or draw (double chance)",
+        "Both teams to score: Yes",
+        "Both teams to score: No",
+    ]
+    for line in sorted(getattr(forecast, "over_probs", {}) or {}):
+        bets.append(f"Over {line} goals")
+        bets.append(f"Under {line} goals")
+    return bets
+
+
+def value_board(forecast, odds_markets: Optional[dict], home: str, away: str) -> list[dict]:
+    """Edge of the in-house model against the market for every priceable bet.
+
+    edge = model probability - market-implied probability (1 / decimal odds).
+    A positive edge means the model rates the bet more likely than the price does
+    — the only sound reason to back it. Sorted most-favourable first.
+    """
+    if forecast is None:
+        return []
+    from model import prob_for_bet
+
+    rows: list[dict] = []
+    for bet in _candidate_bets(forecast, home, away):
+        prob = prob_for_bet(forecast, bet, home, away)
+        odds = price_bet(odds_markets or {}, bet, home, away)
+        if prob is None or not odds:
+            continue
+        implied = 1.0 / odds
+        rows.append({
+            "bet": bet,
+            "odds": round(odds, 2),
+            "model_prob": round(prob, 4),
+            "implied": round(implied, 4),
+            "edge": round(prob - implied, 4),
+        })
+    rows.sort(key=lambda r: r["edge"], reverse=True)
+    return rows
+
+
+def best_value_bet(board: list[dict], min_edge: Optional[float] = None) -> Optional[dict]:
+    """The highest-edge bet that clears the value threshold, or None if the market
+    looks efficient (no bet meets the bar)."""
+    threshold = config.MIN_EDGE if min_edge is None else min_edge
+    qualifying = [r for r in board if r["edge"] >= threshold]
+    return qualifying[0] if qualifying else None
+
+
 def record_prediction(
     team1, team2, fixture, analysis: str, model: str,
     odds_markets: Optional[dict] = None,
@@ -86,6 +154,11 @@ def record_prediction(
         p = prob_for_bet(forecast, bet, home, away)
         model_prob = round(p, 4) if p is not None else None
 
+    odds = price_bet(odds_markets or {}, bet, home, away)
+    edge = round(model_prob - 1.0 / odds, 4) if (model_prob is not None and odds) else None
+    # Only suggest a stake for a genuine value bet; otherwise it's 0.
+    stake = suggest_stake(model_prob, odds) if (edge is not None and edge >= config.MIN_EDGE) else 0.0
+
     entry = {
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "fixture_id": fixture.fixture_id if fixture else None,
@@ -95,8 +168,10 @@ def record_prediction(
         "model": model,
         "best_bet": bet,
         "confidence": confidence,
-        "odds": price_bet(odds_markets or {}, bet, home, away),
+        "odds": odds,
         "model_prob": model_prob,
+        "edge": edge,
+        "stake_eur": stake,
     }
     LEDGER_PATH.parent.mkdir(exist_ok=True)
     with LEDGER_PATH.open("a") as f:
@@ -118,6 +193,25 @@ def kelly_fraction(prob: Optional[float], odds: Optional[float]) -> float:
     b = odds - 1
     f = (prob * b - (1 - prob)) / b
     return max(0.0, f)
+
+
+def suggest_stake(
+    prob: Optional[float],
+    odds: Optional[float],
+    bankroll: Optional[float] = None,
+    kelly_mult: Optional[float] = None,
+) -> float:
+    """Suggested stake in EUR for a value bet, via fractional Kelly capped at
+    config.MAX_STAKE_FRACTION of the bankroll. Returns 0.0 when there's no edge.
+
+    Quarter-Kelly (config.KELLY_FRACTION) sizing keeps variance sane; the cap
+    stops a single huge edge from suggesting an outsized bet.
+    """
+    bankroll = config.BANKROLL_EUR if bankroll is None else bankroll
+    kelly_mult = config.KELLY_FRACTION if kelly_mult is None else kelly_mult
+    fraction = kelly_mult * kelly_fraction(prob, odds)
+    fraction = min(fraction, config.MAX_STAKE_FRACTION)
+    return round(fraction * bankroll, 2)
 
 
 def brier_score(samples: list[tuple[Optional[float], bool]]) -> Optional[float]:

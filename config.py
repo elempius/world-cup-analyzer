@@ -66,3 +66,12 @@ MARKET_WEIGHT = _float("WCA_MARKET_WEIGHT", 0.65)
 # --- Ledger ---
 # Fraction of full Kelly to stake (0.25 = quarter Kelly, the usual conservative choice).
 KELLY_FRACTION = _float("WCA_KELLY_FRACTION", 0.25)
+# Your betting bankroll in EUR. Stake suggestions are sized as a fraction of this.
+BANKROLL_EUR = _float("WCA_BANKROLL_EUR", 100.0)
+# Hard cap on any single stake suggestion, as a fraction of the bankroll, so an
+# extreme edge can't suggest betting the farm. 0.05 = at most 5% on one bet.
+MAX_STAKE_FRACTION = _float("WCA_MAX_STAKE_FRACTION", 0.05)
+# Minimum edge (model probability minus market-implied probability, 1/odds) for a
+# bet to count as "value" and be eligible as a Best Bet. Below this the market is
+# treated as efficient and the tool recommends no bet. 0.03 = 3 percentage points.
+MIN_EDGE = _float("WCA_MIN_EDGE", 0.03)

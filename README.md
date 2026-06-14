@@ -52,7 +52,10 @@ Optional tuning (all have sensible defaults — see `config.py`):
 | `WCA_MARKET_WEIGHT` | How strongly to anchor the model to de-vigged bookmaker odds, 0–1 (default `0.65`) |
 | `WCA_MAX_MATCH_GOALS` | Cap on one match's goal contribution, to curb minnow stat-padding (default `4`) |
 | `WCA_SHRINK_GAMES` | Phantom average-games added for small-sample shrinkage (default `4`) |
-| `WCA_KELLY_FRACTION` | Fractional-Kelly multiplier used in `record` (default `0.25`) |
+| `WCA_MIN_EDGE` | Minimum model edge over the market for a bet to count as value (default `0.03` = 3%) |
+| `WCA_KELLY_FRACTION` | Fractional-Kelly multiplier for staking (default `0.25` = quarter-Kelly) |
+| `WCA_BANKROLL_EUR` | Bankroll in EUR that stake suggestions are sized against (default `100`) |
+| `WCA_MAX_STAKE_FRACTION` | Hard cap on any single stake, as a fraction of bankroll (default `0.05` = 5%) |
 
 ---
 
@@ -100,13 +103,28 @@ After the analysis streams, `analyze` drops into an interactive session where yo
 
 ---
 
+## Value Board and bet selection
+
+A bet is only worth making when it has **positive expected value** — when the in-house model rates an outcome more likely than the bookmaker's price implies. Before the AI writes anything, the tool builds a **Value Board**: for every market it can price (1X2, double chance, both-teams-to-score, each over/under line) it computes
+
+```
+edge = model probability − implied probability (1 / decimal odds)
+```
+
+and ranks them. The single highest-edge bet that clears `WCA_MIN_EDGE` (default 3%) becomes the recommended **value bet**; if nothing clears the bar, the tool reports **"No value bet"** rather than forcing a pick. This is the guard against the classic failure modes — both reflexively backing longshots *and* backing a short-priced favourite the model actually rates below its price. The AI receives the board as authoritative and must choose its Best Bet from it.
+
+### Suggested stake
+
+For the recommended value bet the tool suggests a EUR stake via **fractional Kelly**: `stake = WCA_KELLY_FRACTION × (edge / (odds − 1)) × WCA_BANKROLL_EUR`, capped at `WCA_MAX_STAKE_FRACTION` of the bankroll so no single bet is oversized. With the defaults (quarter-Kelly, €100 bankroll, 5% cap) a healthy edge suggests a few euros. Set your real bankroll with `WCA_BANKROLL_EUR`. Stakes are a sizing *suggestion*, not advice — bet within your means.
+
 ## Prediction tracking
 
-Every analysis appends its **Best Bet**, confidence, the best available bookmaker odds for that bet, and the in-house model's probability for it to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet). It reports:
+Every analysis appends its **Best Bet**, confidence, the best available bookmaker odds, the model's probability and **edge**, and the suggested **EUR stake** to `results/predictions.jsonl`. Once fixtures finish, `record` shows each bet alongside the final score and auto-grades common markets (1X2, over/under, both teams to score, Asian handicap, double chance, draw no bet). It reports:
 
 - a running **win/loss record** and per-confidence breakdown;
 - **flat 1-unit ROI** at best available odds;
 - **fractional-Kelly ROI**, sizing each stake by the model's edge over the odds (`f = edge / (odds − 1)`, scaled by `WCA_KELLY_FRACTION`) — rewarding bets where the model genuinely disagreed with the market;
+- **suggested EUR P/L and ROI** from the recorded stakes on your bankroll;
 - a **Brier score** measuring how well-calibrated the model's probabilities were (0 = perfect, 0.25 = coin flip).
 
 Unrecognized markets are listed but left ungraded. Re-analyzing a match supersedes its earlier ledger entry.
@@ -160,7 +178,7 @@ The model receives the full data dossier and produces a structured report coveri
 - **Key Tactical Battle**
 - **Players to Watch**
 - **Injury Impact**
-- **Prediction** — built around the in-house statistical forecast, ending with a single high-conviction **Best Bet** recommendation, a confidence rating, and a value argument against the bookmaker odds
+- **Prediction** — built around the in-house statistical forecast, ending with a single **Best Bet** chosen from the Value Board (the highest-edge value bet, or "No value bet" when the market looks efficient), its odds, edge, suggested EUR stake, and a confidence rating
 
 Two things make the analysis trustworthy for a tournament that postdates the model's training data:
 

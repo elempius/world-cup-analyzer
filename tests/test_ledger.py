@@ -3,6 +3,7 @@ import pytest
 import ledger
 from api.models import Team, WCFixture
 from ledger import (
+    best_value_bet,
     brier_score,
     extract_best_bet,
     grade_bet,
@@ -10,6 +11,8 @@ from ledger import (
     load_predictions,
     price_bet,
     record_prediction,
+    suggest_stake,
+    value_board,
 )
 
 MARKETS = {
@@ -47,6 +50,12 @@ def test_price_bet(bet, expected):
 
 def test_price_bet_no_markets():
     assert price_bet({}, "Under 2.5 goals", "Mexico", "South Africa") is None
+
+
+def test_price_bet_rejects_degenerate_odds():
+    # An exotic line the feed lists at 1.0 (no real payout) must not be priced.
+    junk = {"Asian Handicap": {"Home -1.5": 1.0}}
+    assert price_bet(junk, "Mexico -1.5 Asian handicap", "Mexico", "South Africa") is None
 
 
 def test_extract_best_bet_with_confidence():
@@ -175,3 +184,55 @@ def test_record_prediction_with_forecast(tmp_path, monkeypatch):
     entry = load_predictions()[0]
     assert entry["model_prob"] is not None
     assert 0.0 < entry["model_prob"] <= 1.0
+    # Edge and a (possibly zero) EUR stake are recorded alongside.
+    assert "edge" in entry and "stake_eur" in entry
+
+
+def _toy_forecast():
+    from model import forecast_match
+    from api.models import TeamStats
+    home, away = Team(id=1, name="Alpha"), Team(id=2, name="Beta")
+    ts = lambda t, gf, ga: TeamStats(
+        team=t, form="WWWW", played=4, wins=4, draws=0, losses=0,
+        goals_for_avg=str(gf), goals_against_avg=str(ga), clean_sheets=0,
+        biggest_win=None, biggest_loss=None, win_streak=0, preferred_formation=None,
+    )
+    return forecast_match(home, away, [], [], ts(home, 2.2, 0.8), ts(away, 0.8, 2.2), [])
+
+
+def test_value_board_is_sorted_and_priced():
+    f = _toy_forecast()
+    markets = {
+        "Match Winner": {"Home": 1.5, "Draw": 4.0, "Away": 7.0},
+        "Goals Over/Under": {"Over 2.5": 2.0, "Under 2.5": 1.8},
+        "Both Teams Score": {"Yes": 2.0, "No": 1.8},
+    }
+    board = value_board(f, markets, "Alpha", "Beta")
+    assert board, "expected at least one priceable bet"
+    edges = [r["edge"] for r in board]
+    assert edges == sorted(edges, reverse=True)  # most favourable first
+    for r in board:
+        assert r["edge"] == pytest.approx(r["model_prob"] - r["implied"], abs=1e-3)
+        assert r["odds"] > 1.0
+
+
+def test_best_value_bet_threshold():
+    board = [
+        {"bet": "X", "odds": 2.0, "model_prob": 0.55, "implied": 0.50, "edge": 0.05},
+        {"bet": "Y", "odds": 2.0, "model_prob": 0.51, "implied": 0.50, "edge": 0.01},
+    ]
+    assert best_value_bet(board, min_edge=0.03)["bet"] == "X"   # clears bar
+    assert best_value_bet(board, min_edge=0.10) is None         # nothing qualifies
+    assert best_value_bet([], min_edge=0.03) is None
+
+
+@pytest.mark.parametrize(
+    "prob,odds,bankroll,expected",
+    [
+        (0.60, 2.0, 100.0, 5.0),   # f*=0.2, quarter-Kelly=0.05 -> 5% of 100
+        (0.50, 2.0, 100.0, 0.0),   # no edge -> no stake
+        (0.95, 2.0, 100.0, 5.0),   # huge edge clamped to the 5% cap
+    ],
+)
+def test_suggest_stake(prob, odds, bankroll, expected):
+    assert suggest_stake(prob, odds, bankroll=bankroll, kelly_mult=0.25) == pytest.approx(expected)
