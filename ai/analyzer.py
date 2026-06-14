@@ -27,11 +27,13 @@ CRITICAL — data grounding:
   the market. Build your prediction around it, but treat it as a rough estimate, not gospel.
 - Treat any "API-Football Prediction" section as a secondary input only; it is often sparse.
 - Treat the pre-match odds as the market's best probability estimate; it already accounts for squad
-  quality and strength of schedule that the raw form numbers do not. Do NOT reflexively back the
-  underdog or the higher-priced outcome — a longer price is not "value" by itself. Only favour an
-  outcome the market rates unlikely if the dossier gives a concrete, stated reason (injuries,
-  lineups, a clear stylistic mismatch). When the model and market broadly agree, backing the
-  favourite is a perfectly legitimate Best Bet.
+  quality and strength of schedule that the raw form numbers do not. Value comes from the Value
+  Board, never from a price being long or short on its own. Do NOT reflexively back the underdog,
+  and equally do NOT back a short-priced favourite just because it is "safe" — a favourite the model
+  rates below its own price is a money-losing bet, not a Best Bet.
+- The "Value Board" section is authoritative for bet selection. It already computes, for every
+  market that can be priced, the model's edge over the bookmaker (edge = model probability minus
+  implied probability). Your Best Bet must come from it.
 
 Style rules:
 - Do not use emoji anywhere in your response.
@@ -48,13 +50,18 @@ Structure your response with exactly these sections:
 ## Injury Impact
 ## Prediction
 
-The Prediction section must end with a single "Best Bet" — one specific recommendation \
-(e.g. "Argentina -1 Asian handicap", "Under 2.5 goals", "Both teams to score: No") \
-that you have the highest conviction in given all available data, followed by your \
-confidence rating (X/10) and 2-3 sentences explaining your reasoning. Ground the pick in the \
-model probabilities and the dossier; note whether it agrees with the market. Do not force a \
-contrarian angle — if the data does not support disagreeing with the odds, pick the bet you are \
-most confident is correct, even if it is the favourite at a short price.
+The Prediction section must end with a single "Best Bet". A bet is only worth backing when it has
+genuine positive expected value: the model's probability for it must exceed the bookmaker's implied
+probability by at least the edge threshold stated on the Value Board. RULES — follow exactly:
+- Pick the Best Bet from the Value Board entries flagged as value (edge at or above the threshold),
+  preferring the highest-edge one. Never pick an outcome whose edge is negative or below the
+  threshold, no matter how confident you feel about who wins.
+- If NO entry on the Value Board clears the threshold, your Best Bet line must read exactly:
+  "Best Bet: No value bet" — followed by a confidence rating and one sentence noting the market
+  looks efficient for this match. Recommending no bet is a correct, valued outcome, not a failure.
+- For an actual bet, state: the bet, the decimal odds, the model probability, the implied
+  probability, and the edge; then your confidence (X/10) and 2-3 sentences of reasoning grounded in
+  the dossier (why the model's number is trustworthy here).
 """
 
 
@@ -211,6 +218,49 @@ def _format_forecast(f: Optional[MatchForecast]) -> str:
         f"  Both teams to score: {f.p_btts:.0%} (fair {odds['btts_yes']})",
         f"  Most likely scorelines: {scores}",
     ]
+    return "\n".join(lines)
+
+
+def _format_value_board(board: Optional[list[dict]], min_edge: float) -> str:
+    if not board:
+        return ""
+    lines = [
+        f"Model edge vs the market for every priceable bet. "
+        f"edge = model probability - implied probability (1 / decimal odds). "
+        f"A bet is only worth backing when its edge is at least +{min_edge:.0%}.",
+        f"  {'Bet':<34}{'Odds':>7}{'Model':>8}{'Implied':>9}{'Edge':>8}   Value?",
+    ]
+    qualifying: list[dict] = []
+    for r in board:
+        is_value = r["edge"] >= min_edge
+        if is_value:
+            qualifying.append(r)
+        flag = "<- VALUE" if is_value else ""
+        lines.append(
+            f"  {r['bet']:<34}{r['odds']:>7.2f}{r['model_prob']:>7.0%}"
+            f"{r['implied']:>9.0%}{r['edge']:>+8.1%}   {flag}"
+        )
+    if qualifying:
+        top = qualifying[0]
+        from ledger import suggest_stake
+        stake = suggest_stake(top["model_prob"], top["odds"])
+        lines.append(
+            f"\n  Recommended value bet: {top['bet']} at {top['odds']:.2f} "
+            f"(model {top['model_prob']:.0%} vs implied {top['implied']:.0%}, "
+            f"edge {top['edge']:+.1%}). Use this as the Best Bet unless the dossier gives a "
+            f"concrete reason to distrust the model here."
+        )
+        if stake > 0:
+            lines.append(
+                f"  Suggested stake: EUR {stake:.2f} "
+                f"(quarter-Kelly on a EUR {config.BANKROLL_EUR:.0f} bankroll, capped at "
+                f"{config.MAX_STAKE_FRACTION:.0%}). State this stake with your Best Bet."
+            )
+    else:
+        lines.append(
+            f"\n  No bet clears the +{min_edge:.0%} edge threshold — the market looks efficient. "
+            f"The correct Best Bet is \"No value bet\"."
+        )
     return "\n".join(lines)
 
 
@@ -391,6 +441,7 @@ def build_prompt(
     wc_events: Optional[list[FixtureEvent]] = None,
     fixture_players: Optional[list[FixturePlayerStat]] = None,
     forecast: Optional[MatchForecast] = None,
+    value_board: Optional[list[dict]] = None,
 ) -> str:
     if fixture:
         context = (
@@ -496,6 +547,10 @@ def build_prompt(
     forecast_str = _format_forecast(forecast)
     if forecast_str:
         sections += ["## Statistical Model (in-house)", forecast_str, ""]
+
+    vb_str = _format_value_board(value_board, config.MIN_EDGE)
+    if vb_str:
+        sections += ["## Value Board (model edge vs market — authoritative for bet selection)", vb_str, ""]
 
     pred_str = _format_prediction(api_prediction, home_name, away_name)
     if pred_str:
